@@ -166,14 +166,17 @@ pub async fn run_daemon(store: ModelStore, options: DaemonOptions) -> Result<()>
 
 fn build_segmenter(options: &DaemonOptions, store: &ModelStore) -> Result<VadSegmenter> {
     let model_path = store.vad_model_path()?;
-    VadSegmenter::new(VadConfig {
-        end_silence_ms: options.end_silence_ms,
-        pre_roll_ms: options.pre_roll_ms,
-        tail_padding_ms: options.tail_padding_ms,
-        min_speech_ms: options.min_speech_ms,
-        max_segment_ms: options.max_segment_ms,
-        ..VadConfig::default()
-    }, &model_path)
+    VadSegmenter::new(
+        VadConfig {
+            end_silence_ms: options.end_silence_ms,
+            pre_roll_ms: options.pre_roll_ms,
+            tail_padding_ms: options.tail_padding_ms,
+            min_speech_ms: options.min_speech_ms,
+            max_segment_ms: options.max_segment_ms,
+            ..VadConfig::default()
+        },
+        &model_path,
+    )
 }
 
 fn submit_segment(
@@ -267,7 +270,10 @@ fn transcription_worker(
         } else {
             overlay.set(OverlayState {
                 mode: OverlayMode::Error {
-                    message: result.error.clone().unwrap_or_else(|| "转写失败".to_string()),
+                    message: result
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "转写失败".to_string()),
                 },
             });
         }

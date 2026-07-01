@@ -76,7 +76,12 @@ mod tests {
         let paths = AppPaths::resolve(None, None);
         assert_eq!(paths.model_cache_root.file_name().unwrap(), "models");
         assert_eq!(
-            paths.model_cache_root.parent().unwrap().file_name().unwrap(),
+            paths
+                .model_cache_root
+                .parent()
+                .unwrap()
+                .file_name()
+                .unwrap(),
             APP_DIR_NAME
         );
     }

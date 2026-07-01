@@ -35,7 +35,11 @@ pub fn read_wav_mono_i16(path: &Path, target_sample_rate: u32) -> Result<PcmAudi
             } else {
                 reader
                     .samples::<i32>()
-                    .map(|sample| sample.map(|value| (value >> 16).clamp(i16::MIN as i32, i16::MAX as i32) as i16))
+                    .map(|sample| {
+                        sample.map(|value| {
+                            (value >> 16).clamp(i16::MIN as i32, i16::MAX as i32) as i16
+                        })
+                    })
                     .collect::<Result<Vec<_>, _>>()
                     .with_context(|| format!("无法读取 i32 音频样本: {}", path.display()))?
             }

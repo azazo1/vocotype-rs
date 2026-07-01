@@ -33,7 +33,11 @@ impl AudioInput {
                     &config,
                     move |data: &[f32], _| {
                         let mono = f32_to_mono_i16(data, channels);
-                        let resampled = crate::wav::resample_linear_i16(&mono, input_sample_rate, TARGET_SAMPLE_RATE);
+                        let resampled = crate::wav::resample_linear_i16(
+                            &mono,
+                            input_sample_rate,
+                            TARGET_SAMPLE_RATE,
+                        );
                         let _ = sender.try_send(resampled);
                     },
                     err_fn,
@@ -46,7 +50,11 @@ impl AudioInput {
                     &config,
                     move |data: &[i16], _| {
                         let mono = crate::wav::downmix_to_mono(data, channels);
-                        let resampled = crate::wav::resample_linear_i16(&mono, input_sample_rate, TARGET_SAMPLE_RATE);
+                        let resampled = crate::wav::resample_linear_i16(
+                            &mono,
+                            input_sample_rate,
+                            TARGET_SAMPLE_RATE,
+                        );
                         let _ = sender.try_send(resampled);
                     },
                     err_fn,
@@ -59,7 +67,11 @@ impl AudioInput {
                     &config,
                     move |data: &[u16], _| {
                         let mono = u16_to_mono_i16(data, channels);
-                        let resampled = crate::wav::resample_linear_i16(&mono, input_sample_rate, TARGET_SAMPLE_RATE);
+                        let resampled = crate::wav::resample_linear_i16(
+                            &mono,
+                            input_sample_rate,
+                            TARGET_SAMPLE_RATE,
+                        );
                         let _ = sender.try_send(resampled);
                     },
                     err_fn,
@@ -78,10 +90,7 @@ impl AudioInput {
             "音频采集已启动"
         );
 
-        Ok(Self {
-            stream,
-            receiver,
-        })
+        Ok(Self { stream, receiver })
     }
 
     pub fn receiver(&self) -> Receiver<Vec<i16>> {

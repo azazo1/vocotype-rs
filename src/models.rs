@@ -12,14 +12,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, info, warn};
-use tracing_indicatif::{style::ProgressStyle, span_ext::IndicatifSpanExt};
+use tracing_indicatif::{span_ext::IndicatifSpanExt, style::ProgressStyle};
 
 use crate::app::{AppPaths, env_path};
 
 pub const DEFAULT_REVISION: &str = "asr-models";
 pub const ASR_MODEL_NAME: &str = "sherpa-onnx-paraformer-zh-2024-03-09";
-pub const ASR_MODEL_URL: &str =
-    "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-paraformer-zh-2024-03-09.tar.bz2";
+pub const ASR_MODEL_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-paraformer-zh-2024-03-09.tar.bz2";
 pub const VAD_MODEL_NAME: &str = "silero-vad";
 pub const VAD_FILE_NAME: &str = "silero_vad.onnx";
 pub const VAD_MODEL_URL: &str =
@@ -148,7 +147,10 @@ impl ModelStore {
     pub fn model_ready(&self, kind: ModelKind) -> bool {
         match kind {
             ModelKind::Asr => self.asr_model_files().is_ok(),
-            ModelKind::Vad => self.vad_model_path().map(|path| path.exists()).unwrap_or(false),
+            ModelKind::Vad => self
+                .vad_model_path()
+                .map(|path| path.exists())
+                .unwrap_or(false),
         }
     }
 
@@ -215,7 +217,8 @@ impl ModelStore {
         let path = self.manifest_path();
         crate::app::ensure_parent(&path)?;
         let text = serde_json::to_string_pretty(&manifest)?;
-        std::fs::write(&path, text).with_context(|| format!("无法写入 manifest: {}", path.display()))?;
+        std::fs::write(&path, text)
+            .with_context(|| format!("无法写入 manifest: {}", path.display()))?;
         info!(
             path = %path.display(),
             models = manifest.models.len(),
@@ -249,7 +252,10 @@ impl ModelStore {
     }
 
     async fn download_asr(&self, target_dir: &Path) -> Result<()> {
-        let archive = self.paths.cache_entry_dir(ASR_MODEL_NAME).with_extension("tar.bz2");
+        let archive = self
+            .paths
+            .cache_entry_dir(ASR_MODEL_NAME)
+            .with_extension("tar.bz2");
         crate::app::ensure_parent(&archive)?;
         info!(url = ASR_MODEL_URL, path = %archive.display(), "开始下载 ASR 模型");
         download_to_file(ASR_MODEL_URL, &archive).await?;
@@ -263,13 +269,20 @@ impl ModelStore {
     }
 
     async fn download_vad(&self, target_dir: &Path) -> Result<()> {
-        let archive = self.paths.cache_entry_dir(VAD_MODEL_NAME).join(VAD_FILE_NAME);
+        let archive = self
+            .paths
+            .cache_entry_dir(VAD_MODEL_NAME)
+            .join(VAD_FILE_NAME);
         crate::app::ensure_parent(&archive)?;
         info!(url = VAD_MODEL_URL, path = %archive.display(), "开始下载 VAD 模型");
         download_to_file(VAD_MODEL_URL, &archive).await?;
         let checksum = sha256_file_without_progress(&archive)?;
         if checksum != VAD_SHA256 {
-            bail!("VAD 模型校验失败: expected {}, got {}", VAD_SHA256, checksum);
+            bail!(
+                "VAD 模型校验失败: expected {}, got {}",
+                VAD_SHA256,
+                checksum
+            );
         }
 
         let target = target_dir.join(VAD_FILE_NAME);
@@ -322,7 +335,10 @@ async fn download_to_file(url: &str, path: &Path) -> Result<()> {
             .await
             .with_context(|| format!("无法写入下载文件: {}", path.display()))?;
         downloaded += chunk.len() as u64;
-        progress.add(chunk.len() as u64, Some(&download_message(path, downloaded, total)));
+        progress.add(
+            chunk.len() as u64,
+            Some(&download_message(path, downloaded, total)),
+        );
     }
     progress.flush(Some(&download_message(path, downloaded, total)));
     file.flush().await?;
@@ -346,8 +362,10 @@ fn download_bar_style() -> ProgressStyle {
 }
 
 fn download_spinner_style() -> ProgressStyle {
-    ProgressStyle::with_template("{spinner:.green} 下载 [{elapsed_precise}] {bytes} {bytes_per_sec}")
-        .unwrap_or_else(|_| ProgressStyle::default_spinner())
+    ProgressStyle::with_template(
+        "{spinner:.green} 下载 [{elapsed_precise}] {bytes} {bytes_per_sec}",
+    )
+    .unwrap_or_else(|_| ProgressStyle::default_spinner())
 }
 
 fn download_message(path: &Path, downloaded: u64, total: Option<u64>) -> String {
@@ -356,7 +374,12 @@ fn download_message(path: &Path, downloaded: u64, total: Option<u64>) -> String 
         .and_then(|name| name.to_str())
         .unwrap_or("model");
     match total {
-        Some(total) => format!("{} {} / {}", name, format_bytes(downloaded), format_bytes(total)),
+        Some(total) => format!(
+            "{} {} / {}",
+            name,
+            format_bytes(downloaded),
+            format_bytes(total)
+        ),
         None => format!("{} {}", name, format_bytes(downloaded)),
     }
 }
@@ -454,12 +477,8 @@ fn strip_archive_root(path: &Path) -> PathBuf {
 }
 
 fn safe_relative_path(path: &Path) -> bool {
-    path.components().all(|component| {
-        matches!(
-            component,
-            Component::Normal(_) | Component::CurDir
-        )
-    })
+    path.components()
+        .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
 }
 
 fn find_asr_model_file(dir: &Path) -> Result<PathBuf> {
@@ -478,7 +497,10 @@ fn find_asr_model_file(dir: &Path) -> Result<PathBuf> {
                 continue;
             }
             let path = entry.path();
-            if path.extension().is_some_and(|extension| extension == "onnx") {
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "onnx")
+            {
                 candidates.push(path.to_path_buf());
             }
         }
@@ -643,14 +665,22 @@ impl<R: Read> Read for ProgressRead<'_, R> {
 
 pub fn write_doctor_report(store: &ModelStore, mut writer: impl Write) -> Result<()> {
     writeln!(writer, "model_dir={}", store.paths.model_root.display())?;
-    writeln!(writer, "model_cache_dir={}", store.paths.model_cache_root.display())?;
+    writeln!(
+        writer,
+        "model_cache_dir={}",
+        store.paths.model_cache_root.display()
+    )?;
     writeln!(writer, "revision={}", store.revision)?;
     for kind in ModelKind::all() {
         writeln!(
             writer,
             "{}={}",
             kind.label(),
-            if store.model_ready(kind) { "ready" } else { "missing" }
+            if store.model_ready(kind) {
+                "ready"
+            } else {
+                "missing"
+            }
         )?;
     }
     match store.read_manifest()? {
@@ -687,9 +717,18 @@ mod tests {
 
     #[test]
     fn cli_paths_override_defaults() {
-        let store = ModelStore::new(&options(Some("/tmp/vocotype-models"), Some("/tmp/vocotype-cache")));
-        assert_eq!(store.paths.model_root, PathBuf::from("/tmp/vocotype-models"));
-        assert_eq!(store.paths.model_cache_root, PathBuf::from("/tmp/vocotype-cache"));
+        let store = ModelStore::new(&options(
+            Some("/tmp/vocotype-models"),
+            Some("/tmp/vocotype-cache"),
+        ));
+        assert_eq!(
+            store.paths.model_root,
+            PathBuf::from("/tmp/vocotype-models")
+        );
+        assert_eq!(
+            store.paths.model_cache_root,
+            PathBuf::from("/tmp/vocotype-cache")
+        );
     }
 
     #[test]

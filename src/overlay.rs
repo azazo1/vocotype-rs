@@ -64,11 +64,9 @@ pub fn start() -> Result<OverlayHandle> {
                 .with_always_on_top(),
             ..Default::default()
         };
-        if let Err(error) = eframe::run_native(
-            "VocoType",
-            native_options,
-            Box::new(|_| Ok(Box::new(app))),
-        ) {
+        if let Err(error) =
+            eframe::run_native("VocoType", native_options, Box::new(|_| Ok(Box::new(app))))
+        {
             warn!(%error, "悬浮窗退出");
         }
     });
@@ -90,7 +88,11 @@ impl eframe::App for OverlayApp {
             }
         }
 
-        let state = self.state.lock().map(|guard| guard.clone()).unwrap_or_default();
+        let state = self
+            .state
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
             ui.painter()

@@ -32,7 +32,12 @@ impl DatasetRecorder {
         Ok(Self { root })
     }
 
-    pub fn record(&self, result: &TranscriptionResult, sample_rate: u32, samples: &[i16]) -> Result<()> {
+    pub fn record(
+        &self,
+        result: &TranscriptionResult,
+        sample_rate: u32,
+        samples: &[i16],
+    ) -> Result<()> {
         if !result.success {
             return Ok(());
         }

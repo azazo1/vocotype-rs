@@ -50,7 +50,9 @@ fn direct_type(text: &str) -> Result<()> {
 fn clipboard_paste(text: &str) -> Result<()> {
     let mut clipboard = arboard::Clipboard::new().map_err(|error| anyhow!(error))?;
     let old = clipboard.get_text().ok();
-    clipboard.set_text(text.to_string()).map_err(|error| anyhow!(error))?;
+    clipboard
+        .set_text(text.to_string())
+        .map_err(|error| anyhow!(error))?;
 
     let mut enigo = Enigo::new();
     paste_shortcut(&mut enigo);

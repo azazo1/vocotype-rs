@@ -1,9 +1,9 @@
 mod app;
-mod audio;
 mod asr;
+mod audio;
 mod cli;
-mod dataset;
 mod daemon;
+mod dataset;
 mod hotkey;
 mod inject;
 mod logging;
