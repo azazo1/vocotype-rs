@@ -287,6 +287,12 @@ fn transcription_worker(
                 });
             }
         } else {
+            let duration_label = format!("{:.2}", result.duration);
+            warn!(
+                error = result.error.as_deref().unwrap_or("unknown"),
+                duration = %duration_label,
+                "语音段转写失败"
+            );
             overlay.set(OverlayState {
                 mode: OverlayMode::Error {
                     message: result

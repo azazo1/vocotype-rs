@@ -65,19 +65,31 @@ impl AsrEngine {
             .ok_or_else(|| anyhow!("ASR 解码没有返回结果"))?;
         let text = result.text.trim().to_string();
         let latency = start.elapsed().as_secs_f32();
-        debug!(
-            duration = audio.duration_seconds(),
-            latency,
-            chars = text.chars().count(),
-            "ASR 转写完成"
-        );
-
+        let duration = audio.duration_seconds();
+        let duration_label = format!("{:.2}", duration);
+        let latency_label = format!("{:.2}", latency);
         let success = !text.is_empty();
+        if success {
+            info!(
+                duration = %duration_label,
+                latency = %latency_label,
+                chars = text.chars().count(),
+                text = %text,
+                "ASR 转写完成"
+            );
+        } else {
+            debug!(
+                duration = %duration_label,
+                latency = %latency_label,
+                "ASR 没有识别到文本"
+            );
+        }
+
         Ok(TranscriptionResult {
             success,
             text: text.clone(),
             raw_text: text,
-            duration: audio.duration_seconds(),
+            duration,
             inference_latency: latency,
             confidence: if success { 1.0 } else { 0.0 },
             error: if success {
