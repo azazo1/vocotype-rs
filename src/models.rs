@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use bzip2::read::BzDecoder;
@@ -11,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, info, warn};
+use tracing_indicatif::{style::ProgressStyle, span_ext::IndicatifSpanExt};
 
 use crate::app::{AppPaths, env_path};
 
@@ -189,10 +191,12 @@ impl ModelStore {
     }
 
     pub fn write_manifest(&self) -> Result<ModelManifest> {
+        let started = Instant::now();
+        info!(path = %self.manifest_path().display(), "开始生成模型 manifest");
         let mut models = BTreeMap::new();
         for kind in ModelKind::all() {
             let dir = self.model_dir(kind);
-            let files = hash_model_files(&dir)?;
+            let files = hash_model_files(kind, &dir)?;
             models.insert(
                 kind.label().to_string(),
                 ManifestModel {
@@ -212,6 +216,12 @@ impl ModelStore {
         crate::app::ensure_parent(&path)?;
         let text = serde_json::to_string_pretty(&manifest)?;
         std::fs::write(&path, text).with_context(|| format!("无法写入 manifest: {}", path.display()))?;
+        info!(
+            path = %path.display(),
+            models = manifest.models.len(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "模型 manifest 写入完成"
+        );
         Ok(manifest)
     }
 
@@ -257,7 +267,7 @@ impl ModelStore {
         crate::app::ensure_parent(&archive)?;
         info!(url = VAD_MODEL_URL, path = %archive.display(), "开始下载 VAD 模型");
         download_to_file(VAD_MODEL_URL, &archive).await?;
-        let checksum = sha256_file(&archive)?;
+        let checksum = sha256_file_without_progress(&archive)?;
         if checksum != VAD_SHA256 {
             bail!("VAD 模型校验失败: expected {}, got {}", VAD_SHA256, checksum);
         }
@@ -283,12 +293,28 @@ async fn download_to_file(url: &str, path: &Path) -> Result<()> {
     }
 
     let total = response.content_length();
+    let span = tracing::info_span!(
+        "下载模型",
+        indicatif.pb_show = tracing::field::Empty,
+        url = %url,
+        path = %path.display(),
+    );
+    let _enter = span.enter();
+    if let Some(total) = total {
+        span.pb_set_length(total);
+        span.pb_set_style(&download_bar_style());
+    } else {
+        span.pb_set_style(&download_spinner_style());
+    }
+    span.pb_set_message(&download_message(path, 0, total));
+    span.pb_start();
+
     let mut stream = response.bytes_stream();
     let mut file = tokio::fs::File::create(path)
         .await
         .with_context(|| format!("无法创建下载文件: {}", path.display()))?;
     let mut downloaded = 0_u64;
-    let mut last_logged = 0_u64;
+    let mut progress = ProgressThrottle::new(&span);
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.with_context(|| format!("模型下载中断: {}", url))?;
@@ -296,17 +322,61 @@ async fn download_to_file(url: &str, path: &Path) -> Result<()> {
             .await
             .with_context(|| format!("无法写入下载文件: {}", path.display()))?;
         downloaded += chunk.len() as u64;
-        if downloaded.saturating_sub(last_logged) >= 64 * 1024 * 1024 {
-            last_logged = downloaded;
-            match total {
-                Some(total) => info!(downloaded, total, "模型下载进度"),
-                None => info!(downloaded, "模型下载进度"),
-            }
-        }
+        progress.add(chunk.len() as u64, Some(&download_message(path, downloaded, total)));
     }
+    progress.flush(Some(&download_message(path, downloaded, total)));
     file.flush().await?;
+    span.pb_set_finish_message(&format!(
+        "下载完成 {} {}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("model"),
+        format_bytes(downloaded)
+    ));
     debug!(downloaded, path = %path.display(), "模型下载文件写入完成");
     Ok(())
+}
+
+fn download_bar_style() -> ProgressStyle {
+    ProgressStyle::with_template(
+        "{spinner:.green} {wide_msg} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} {bytes_per_sec} eta {eta}",
+    )
+    .unwrap_or_else(|_| ProgressStyle::default_bar())
+    .progress_chars("=>-")
+}
+
+fn download_spinner_style() -> ProgressStyle {
+    ProgressStyle::with_template("{spinner:.green} {wide_msg} [{elapsed_precise}] {bytes} {bytes_per_sec}")
+        .unwrap_or_else(|_| ProgressStyle::default_spinner())
+}
+
+fn download_message(path: &Path, downloaded: u64, total: Option<u64>) -> String {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("model");
+    match total {
+        Some(total) => format!("{} {} / {}", name, format_bytes(downloaded), format_bytes(total)),
+        None => format!("{} {}", name, format_bytes(downloaded)),
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = UNITS[0];
+    for next in UNITS.iter().skip(1) {
+        if value < 1024.0 {
+            break;
+        }
+        value /= 1024.0;
+        unit = next;
+    }
+    if unit == "B" {
+        format!("{} {}", bytes, unit)
+    } else {
+        format!("{:.1} {}", value, unit)
+    }
 }
 
 fn extract_tar_bz2(archive: &Path, target_dir: &Path) -> Result<()> {
@@ -384,41 +454,127 @@ fn find_asr_model_file(dir: &Path) -> Result<PathBuf> {
         .ok_or_else(|| anyhow::anyhow!("ASR 模型文件不存在: {}", dir.display()))
 }
 
-fn hash_model_files(dir: &Path) -> Result<BTreeMap<String, String>> {
+fn hash_model_files(kind: ModelKind, dir: &Path) -> Result<BTreeMap<String, String>> {
     let mut files = BTreeMap::new();
     if !dir.exists() {
+        info!(path = %dir.display(), "模型目录不存在, 跳过校验和计算");
         return Ok(files);
     }
 
+    let mut entries = Vec::new();
     for entry in walkdir::WalkDir::new(dir) {
         let entry = entry?;
         if !entry.file_type().is_file() {
             continue;
         }
-        let path = entry.path();
+        let path = entry.path().to_path_buf();
+        let size = entry.metadata().map(|metadata| metadata.len()).unwrap_or(0);
         let relative = path
             .strip_prefix(dir)
-            .unwrap_or(path)
+            .unwrap_or(&path)
             .to_string_lossy()
             .replace('\\', "/");
-        files.insert(relative, sha256_file(path)?);
+        entries.push((relative, path, size));
     }
 
+    let total_bytes = entries
+        .iter()
+        .map(|(_, _, size)| *size)
+        .fold(0_u64, u64::saturating_add);
+    let span = checksum_span(kind, dir, total_bytes);
+    let _enter = span.enter();
+
+    for (relative, path, _size) in entries {
+        let digest = sha256_file(&path, &span)?;
+        files.insert(relative, digest);
+    }
+
+    span.pb_set_finish_message(&format!(
+        "校验完成 {} {}",
+        kind.label(),
+        format_bytes(total_bytes)
+    ));
     Ok(files)
 }
 
-fn sha256_file(path: &Path) -> Result<String> {
+fn checksum_span(kind: ModelKind, dir: &Path, total_bytes: u64) -> tracing::Span {
+    let span = tracing::info_span!(
+        "计算校验和",
+        indicatif.pb_show = tracing::field::Empty,
+        model = kind.label(),
+        path = %dir.display(),
+    );
+    span.pb_set_length(total_bytes);
+    span.pb_set_style(&checksum_bar_style());
+    span.pb_set_message(&format!("{} {}", kind.label(), format_bytes(total_bytes)));
+    span.pb_start();
+    span
+}
+
+fn checksum_bar_style() -> ProgressStyle {
+    ProgressStyle::with_template(
+        "{spinner:.green} sha256 {wide_msg} [{elapsed_precise}] [{wide_bar:.magenta/blue}] {bytes}/{total_bytes} {bytes_per_sec} eta {eta}",
+    )
+    .unwrap_or_else(|_| ProgressStyle::default_bar())
+    .progress_chars("=>-")
+}
+
+fn sha256_file(path: &Path, span: &tracing::Span) -> Result<String> {
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
+    let mut progress = ProgressThrottle::new(span);
     loop {
         let read = file.read(&mut buffer)?;
         if read == 0 {
             break;
         }
         hasher.update(&buffer[..read]);
+        progress.add(read as u64, None);
     }
+    progress.flush(None);
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn sha256_file_without_progress(path: &Path) -> Result<String> {
+    let span = tracing::Span::none();
+    sha256_file(path, &span)
+}
+
+struct ProgressThrottle<'a> {
+    span: &'a tracing::Span,
+    pending: u64,
+    last_update: Instant,
+    interval: Duration,
+}
+
+impl<'a> ProgressThrottle<'a> {
+    fn new(span: &'a tracing::Span) -> Self {
+        Self {
+            span,
+            pending: 0,
+            last_update: Instant::now(),
+            interval: Duration::from_millis(200),
+        }
+    }
+
+    fn add(&mut self, bytes: u64, message: Option<&str>) {
+        self.pending = self.pending.saturating_add(bytes);
+        if self.last_update.elapsed() >= self.interval {
+            self.flush(message);
+        }
+    }
+
+    fn flush(&mut self, message: Option<&str>) {
+        if self.pending > 0 {
+            self.span.pb_inc(self.pending);
+            self.pending = 0;
+        }
+        if let Some(message) = message {
+            self.span.pb_set_message(message);
+        }
+        self.last_update = Instant::now();
+    }
 }
 
 pub fn write_doctor_report(store: &ModelStore, mut writer: impl Write) -> Result<()> {

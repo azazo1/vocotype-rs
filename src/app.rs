@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+pub const APP_DIR_NAME: &str = "vocotype-rs";
+
 #[derive(Clone, Debug)]
 pub struct AppPaths {
     pub model_root: PathBuf,
@@ -10,15 +12,15 @@ pub struct AppPaths {
 
 impl AppPaths {
     pub fn resolve(model_root: Option<PathBuf>, model_cache_root: Option<PathBuf>) -> Self {
-        let dirs = directories::ProjectDirs::from("com", "vocotype", "vocotype-rs");
-        let data_base = dirs
+        let base_dirs = directories::BaseDirs::new();
+        let data_base = base_dirs
             .as_ref()
-            .map(|dirs| dirs.data_local_dir().to_path_buf())
-            .unwrap_or_else(|| std::env::temp_dir().join("vocotype-rs"));
-        let cache_base = dirs
+            .map(|dirs| dirs.data_local_dir().join(APP_DIR_NAME))
+            .unwrap_or_else(|| std::env::temp_dir().join(APP_DIR_NAME));
+        let cache_base = base_dirs
             .as_ref()
-            .map(|dirs| dirs.cache_dir().to_path_buf())
-            .unwrap_or_else(|| std::env::temp_dir().join("vocotype-rs-cache"));
+            .map(|dirs| dirs.cache_dir().join(APP_DIR_NAME))
+            .unwrap_or_else(|| std::env::temp_dir().join(APP_DIR_NAME));
 
         let default_model_cache = cache_base.join("models");
         let default_model_root = model_cache_root
@@ -63,4 +65,33 @@ pub fn ensure_parent(path: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_cache_dir_uses_app_folder_name() {
+        let paths = AppPaths::resolve(None, None);
+        assert_eq!(paths.model_cache_root.file_name().unwrap(), "models");
+        assert_eq!(
+            paths.model_cache_root.parent().unwrap().file_name().unwrap(),
+            APP_DIR_NAME
+        );
+    }
+
+    #[test]
+    fn default_data_dir_uses_app_folder_name() {
+        let paths = AppPaths::resolve(None, None);
+        assert_eq!(paths.data_dir.file_name().unwrap(), APP_DIR_NAME);
+        assert_eq!(paths.log_dir, paths.data_dir.join("logs"));
+    }
+
+    #[test]
+    fn explicit_cache_dir_overrides_default() {
+        let paths = AppPaths::resolve(None, Some(PathBuf::from("/tmp/custom-cache")));
+        assert_eq!(paths.model_root, PathBuf::from("/tmp/custom-cache"));
+        assert_eq!(paths.model_cache_root, PathBuf::from("/tmp/custom-cache"));
+    }
 }
