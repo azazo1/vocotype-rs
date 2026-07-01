@@ -91,23 +91,24 @@ impl OverlayApp {
 }
 
 impl eframe::App for OverlayApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.ensure_initial_hidden(ctx);
         self.drain_updates(ctx);
         self.handle_auto_hide(ctx);
-
-        if self.visible {
-            draw_overlay(ctx, &self.current_state());
-        }
-
         ctx.request_repaint_after(REPAINT_INTERVAL);
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if self.visible {
+            draw_overlay(ui, &self.current_state());
+        }
     }
 }
 
-fn draw_overlay(ctx: &egui::Context, state: &OverlayState) {
+fn draw_overlay(ui: &mut egui::Ui, state: &OverlayState) {
     egui::CentralPanel::default()
-        .frame(egui::Frame::none().fill(egui::Color32::from_rgb(24, 28, 33)))
-        .show(ctx, |ui| {
+        .frame(egui::Frame::new().fill(egui::Color32::from_rgb(24, 28, 33)))
+        .show(ui, |ui| {
             ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
             ui.add_space(8.0);
             ui.horizontal(|ui| {

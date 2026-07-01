@@ -15,13 +15,13 @@ impl AudioInput {
     pub fn start(device_name: Option<&str>) -> Result<Self> {
         let host = cpal::default_host();
         let device = select_input_device(&host, device_name)?;
-        let device_label = device.name().unwrap_or_else(|_| "unknown".to_string());
+        let device_label = device.to_string();
         let supported = device
             .default_input_config()
             .with_context(|| format!("无法读取输入设备配置: {}", device_label))?;
         let sample_format = supported.sample_format();
         let config = supported.config();
-        let input_sample_rate = config.sample_rate.0;
+        let input_sample_rate = config.sample_rate;
         let channels = config.channels as usize;
         let (sender, receiver) = bounded::<Vec<i16>>(256);
 
@@ -30,7 +30,7 @@ impl AudioInput {
             SampleFormat::F32 => {
                 let sender = sender.clone();
                 device.build_input_stream(
-                    &config,
+                    config,
                     move |data: &[f32], _| {
                         let mono = f32_to_mono_i16(data, channels);
                         let resampled = crate::wav::resample_linear_i16(
@@ -47,7 +47,7 @@ impl AudioInput {
             SampleFormat::I16 => {
                 let sender = sender.clone();
                 device.build_input_stream(
-                    &config,
+                    config,
                     move |data: &[i16], _| {
                         let mono = crate::wav::downmix_to_mono(data, channels);
                         let resampled = crate::wav::resample_linear_i16(
@@ -64,7 +64,7 @@ impl AudioInput {
             SampleFormat::U16 => {
                 let sender = sender.clone();
                 device.build_input_stream(
-                    &config,
+                    config,
                     move |data: &[u16], _| {
                         let mono = u16_to_mono_i16(data, channels);
                         let resampled = crate::wav::resample_linear_i16(
@@ -106,13 +106,13 @@ impl AudioInput {
 pub fn list_input_devices() -> Result<Vec<String>> {
     let host = cpal::default_host();
     let devices = host.input_devices()?;
-    Ok(devices.filter_map(|device| device.name().ok()).collect())
+    Ok(devices.map(|device| device.to_string()).collect())
 }
 
 fn select_input_device(host: &cpal::Host, device_name: Option<&str>) -> Result<cpal::Device> {
     if let Some(expected) = device_name {
         for device in host.input_devices()? {
-            let name = device.name().unwrap_or_default();
+            let name = device.to_string();
             if name.contains(expected) {
                 return Ok(device);
             }

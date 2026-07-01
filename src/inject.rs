@@ -4,7 +4,7 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
-use enigo::{Enigo, KeyboardControllable};
+use enigo::{Enigo, Keyboard, Settings};
 use tracing::{debug, warn};
 
 const CLIPBOARD_READY_DELAY: Duration = Duration::from_millis(80);
@@ -64,7 +64,7 @@ fn direct_type(text: &str) -> Result<()> {
     }
 
     run_enigo("直接输入", |enigo| {
-        enigo.key_sequence(text);
+        enigo.text(text)
     })
 }
 
@@ -87,12 +87,13 @@ fn clipboard_paste(text: &str) -> Result<()> {
     Ok(())
 }
 
-fn run_enigo(action: &str, f: impl FnOnce(&mut Enigo)) -> Result<()> {
-    catch_unwind(AssertUnwindSafe(|| {
-        let mut enigo = Enigo::new();
-        f(&mut enigo);
+fn run_enigo(action: &str, f: impl FnOnce(&mut Enigo) -> enigo::InputResult<()>) -> Result<()> {
+    catch_unwind(AssertUnwindSafe(|| -> Result<()> {
+        let mut enigo = Enigo::new(&Settings::default())
+            .map_err(|error| anyhow!("{}连接失败: {}", action, error))?;
+        f(&mut enigo).map_err(|error| anyhow!("{}失败: {}", action, error))
     }))
-    .map_err(|payload| anyhow!("{}失败: {}", action, panic_message(payload)))
+    .map_err(|payload| anyhow!("{}失败: {}", action, panic_message(payload)))?
 }
 
 fn panic_message(payload: Box<dyn Any + Send>) -> String {
@@ -123,11 +124,11 @@ fn paste_shortcut() -> Result<()> {
 
 #[cfg(not(target_os = "macos"))]
 fn paste_shortcut() -> Result<()> {
-    use enigo::Key;
+    use enigo::{Direction, Key};
 
     run_enigo("剪贴板快捷键", |enigo| {
-        enigo.key_down(Key::Control);
-        enigo.key_click(Key::Layout('v'));
-        enigo.key_up(Key::Control);
+        enigo.key(Key::Control, Direction::Press)?;
+        enigo.key(Key::Unicode('v'), Direction::Click)?;
+        enigo.key(Key::Control, Direction::Release)
     })
 }

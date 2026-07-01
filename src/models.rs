@@ -603,7 +603,11 @@ fn sha256_file(path: &Path, span: &tracing::Span) -> Result<String> {
         progress.add(read as u64, None);
     }
     progress.flush(None);
-    Ok(format!("{:x}", hasher.finalize()))
+    let digest = hasher.finalize();
+    Ok(digest
+        .iter()
+        .map(|byte| format!("{:02x}", byte))
+        .collect::<String>())
 }
 
 fn sha256_file_without_progress(path: &Path) -> Result<String> {

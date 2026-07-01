@@ -15,7 +15,7 @@ pub(crate) fn configure_window(cc: &eframe::CreationContext<'_>) {
 }
 
 fn configure_window_inner(cc: &eframe::CreationContext<'_>) -> Result<(), String> {
-    use objc2::rc::Id;
+    use objc2::rc::Retained;
     use objc2_app_kit::{NSView, NSWindowCollectionBehavior};
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
@@ -25,8 +25,8 @@ fn configure_window_inner(cc: &eframe::CreationContext<'_>) -> Result<(), String
     };
 
     let ns_view_ptr = handle.ns_view.as_ptr();
-    let ns_view: Id<NSView> =
-        unsafe { Id::retain(ns_view_ptr.cast()) }.ok_or("NSView 指针无效")?;
+    let ns_view: Retained<NSView> =
+        unsafe { Retained::retain(ns_view_ptr.cast()) }.ok_or("NSView 指针无效")?;
     let ns_window = ns_view.window().ok_or("NSView 未关联 NSWindow")?;
     let behavior = NSWindowCollectionBehavior::CanJoinAllSpaces
         | NSWindowCollectionBehavior::FullScreenAuxiliary
@@ -34,8 +34,6 @@ fn configure_window_inner(cc: &eframe::CreationContext<'_>) -> Result<(), String
         | NSWindowCollectionBehavior::Stationary
         | NSWindowCollectionBehavior::IgnoresCycle;
 
-    unsafe {
-        ns_window.setCollectionBehavior(behavior);
-    }
+    ns_window.setCollectionBehavior(behavior);
     Ok(())
 }

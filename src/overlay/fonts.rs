@@ -11,7 +11,7 @@ pub(crate) fn install(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     fonts
         .font_data
-        .insert(FONT_NAME.to_string(), egui::FontData::from_owned(bytes));
+        .insert(FONT_NAME.to_string(), egui::FontData::from_owned(bytes).into());
     fonts
         .families
         .entry(egui::FontFamily::Proportional)
