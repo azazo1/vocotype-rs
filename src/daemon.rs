@@ -133,6 +133,16 @@ fn run_daemon_loop(
                         debug!("热键释放, 结束录音");
                         capturing = false;
                         set_recording(&state, false);
+                        if let Some(rx) = &audio_rx {
+                            drain_release_tail(
+                                rx,
+                                &mut segmenter,
+                                &segment_tx,
+                                &state,
+                                &overlay,
+                                Duration::from_millis(options.tail_padding_ms as u64),
+                            )?;
+                        }
                         for segment in segmenter.finish() {
                             submit_segment(&segment_tx, &state, &overlay, segment)?;
                         }
@@ -234,6 +244,32 @@ fn submit_segment(
     Ok(())
 }
 
+fn drain_release_tail(
+    audio_rx: &Receiver<Vec<i16>>,
+    segmenter: &mut VadSegmenter,
+    segment_tx: &Sender<SpeechSegment>,
+    state: &Arc<Mutex<RuntimeState>>,
+    overlay: &OverlayHandle,
+    wait: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + wait;
+    while Instant::now() < deadline {
+        let timeout = deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(10));
+        match audio_rx.recv_timeout(timeout) {
+            Ok(frame) => {
+                for segment in segmenter.push(&frame) {
+                    submit_segment(segment_tx, state, overlay, segment)?;
+                }
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    Ok(())
+}
+
 fn transcription_worker(
     engine: Arc<AsrEngine>,
     dataset: Option<DatasetRecorder>,
@@ -267,7 +303,7 @@ fn transcription_worker(
             warn!(%error, "数据集记录失败");
         }
 
-        {
+        let remaining = {
             let mut guard = match state.lock() {
                 Ok(guard) => guard,
                 Err(_) => {
@@ -277,26 +313,24 @@ fn transcription_worker(
             };
             guard.queued = guard.queued.saturating_sub(1);
             guard.active_text = result.text.clone();
-        }
+            guard.queued
+        };
 
         if result.success {
-            overlay.set(OverlayState {
-                mode: OverlayMode::Done {
-                    text: result.text.clone(),
-                },
-            });
             if let Err(error) = type_text(&result.text, append_newline, inject_method.clone()) {
                 overlay.set(OverlayState {
                     mode: OverlayMode::Error {
                         message: format!("文本注入失败: {}", error),
                     },
                 });
+            } else {
+                overlay.set(OverlayState {
+                    mode: final_result_mode(remaining, result.text.clone()),
+                });
             }
         } else if result.is_empty_transcription() {
             overlay.set(OverlayState {
-                mode: OverlayMode::Done {
-                    text: "未识别到内容".to_string(),
-                },
+                mode: final_result_mode(remaining, "未识别到内容".to_string()),
             });
         } else {
             let duration_label = format!("{:.2}", result.duration);
@@ -314,6 +348,14 @@ fn transcription_worker(
                 },
             });
         }
+    }
+}
+
+fn final_result_mode(remaining: usize, text: String) -> OverlayMode {
+    if remaining == 0 {
+        OverlayMode::Done { text }
+    } else {
+        OverlayMode::Transcribing { pending: remaining }
     }
 }
 
