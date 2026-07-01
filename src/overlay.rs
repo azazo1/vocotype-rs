@@ -1,8 +1,9 @@
-use std::sync::{Arc, Mutex};
-use std::thread;
+//! 悬浮窗
 
-use anyhow::Result;
-use crossbeam_channel::{Sender, unbounded};
+use std::sync::{Arc, Mutex};
+
+use anyhow::{Result, anyhow};
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use tracing::{info, warn};
 
 #[derive(Clone, Debug)]
@@ -33,6 +34,11 @@ pub struct OverlayHandle {
     sender: Sender<OverlayState>,
 }
 
+pub struct OverlayRunner {
+    state: Arc<Mutex<OverlayState>>,
+    receiver: Receiver<OverlayState>,
+}
+
 impl OverlayHandle {
     pub fn set(&self, state: OverlayState) {
         let _ = self.sender.send(state);
@@ -45,15 +51,20 @@ impl OverlayHandle {
     }
 }
 
-pub fn start() -> Result<OverlayHandle> {
+pub fn create() -> (OverlayHandle, OverlayRunner) {
     let (sender, receiver) = unbounded::<OverlayState>();
     let state = Arc::new(Mutex::new(OverlayState::default()));
-    let thread_state = state.clone();
+    (
+        OverlayHandle { sender },
+        OverlayRunner { state, receiver },
+    )
+}
 
-    thread::spawn(move || {
+impl OverlayRunner {
+    pub fn run(self) -> Result<()> {
         let app = OverlayApp {
-            state: thread_state,
-            receiver,
+            state: self.state,
+            receiver: self.receiver,
         };
         let native_options = eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
@@ -64,15 +75,14 @@ pub fn start() -> Result<OverlayHandle> {
                 .with_always_on_top(),
             ..Default::default()
         };
-        if let Err(error) =
-            eframe::run_native("VocoType", native_options, Box::new(|_| Ok(Box::new(app))))
-        {
-            warn!(%error, "悬浮窗退出");
-        }
-    });
-
-    info!("悬浮窗线程已启动");
-    Ok(OverlayHandle { sender })
+        info!("悬浮窗事件循环已启动");
+        eframe::run_native("VocoType", native_options, Box::new(|_| Ok(Box::new(app)))).map_err(
+            |error| {
+                warn!(%error, "悬浮窗退出");
+                anyhow!("悬浮窗运行失败: {}", error)
+            },
+        )
+    }
 }
 
 struct OverlayApp {

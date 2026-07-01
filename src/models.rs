@@ -147,10 +147,7 @@ impl ModelStore {
     pub fn model_ready(&self, kind: ModelKind) -> bool {
         match kind {
             ModelKind::Asr => self.asr_model_files().is_ok(),
-            ModelKind::Vad => self
-                .vad_model_path()
-                .map(|path| path.exists())
-                .unwrap_or(false),
+            ModelKind::Vad => self.verify_vad_checksum().is_ok(),
         }
     }
 
@@ -174,6 +171,20 @@ impl ModelStore {
             bail!("VAD 模型文件不存在: {}", path.display());
         }
         Ok(path)
+    }
+
+    pub fn verify_vad_checksum(&self) -> Result<()> {
+        let path = self.vad_model_path()?;
+        let checksum = sha256_file_without_progress(&path)?;
+        if checksum != VAD_SHA256 {
+            bail!(
+                "VAD 模型校验失败: expected {}, got {}. 请重新运行: {}",
+                VAD_SHA256,
+                checksum,
+                self.download_hint()
+            );
+        }
+        Ok(())
     }
 
     pub fn manifest_path(&self) -> PathBuf {
@@ -269,14 +280,12 @@ impl ModelStore {
     }
 
     async fn download_vad(&self, target_dir: &Path) -> Result<()> {
-        let archive = self
-            .paths
-            .cache_entry_dir(VAD_MODEL_NAME)
-            .join(VAD_FILE_NAME);
-        crate::app::ensure_parent(&archive)?;
-        info!(url = VAD_MODEL_URL, path = %archive.display(), "开始下载 VAD 模型");
-        download_to_file(VAD_MODEL_URL, &archive).await?;
-        let checksum = sha256_file_without_progress(&archive)?;
+        let target = target_dir.join(VAD_FILE_NAME);
+        let temporary = vad_temporary_path(&target);
+        crate::app::ensure_parent(&temporary)?;
+        info!(url = VAD_MODEL_URL, path = %temporary.display(), "开始下载 VAD 模型");
+        download_to_file(VAD_MODEL_URL, &temporary).await?;
+        let checksum = sha256_file_without_progress(&temporary)?;
         if checksum != VAD_SHA256 {
             bail!(
                 "VAD 模型校验失败: expected {}, got {}",
@@ -285,13 +294,16 @@ impl ModelStore {
             );
         }
 
-        let target = target_dir.join(VAD_FILE_NAME);
         crate::app::ensure_parent(&target)?;
-        std::fs::copy(&archive, &target)
-            .with_context(|| format!("无法复制 VAD 模型到 {}", target.display()))?;
+        std::fs::rename(&temporary, &target)
+            .with_context(|| format!("无法保存 VAD 模型到 {}", target.display()))?;
         info!(path = %target.display(), "VAD 模型下载完成");
         Ok(())
     }
+}
+
+fn vad_temporary_path(target: &Path) -> PathBuf {
+    target.with_extension("onnx.download")
 }
 
 async fn download_to_file(url: &str, path: &Path) -> Result<()> {
@@ -696,6 +708,7 @@ pub fn write_doctor_report(store: &ModelStore, mut writer: impl Write) -> Result
 pub fn loadability_report(store: &ModelStore, mut writer: impl Write) -> Result<()> {
     store.verify_required()?;
     let _engine = crate::asr::AsrEngine::load(store.clone())?;
+    store.verify_vad_checksum()?;
     let vad_model = store.vad_model_path()?;
     let _vad = crate::vad::VadSegmenter::new(crate::vad::VadConfig::default(), &vad_model)?;
     writeln!(writer, "sherpa_asr=loadable")?;
@@ -786,7 +799,38 @@ mod tests {
         let vad_dir = store.model_dir(ModelKind::Vad);
         std::fs::create_dir_all(&vad_dir).unwrap();
         std::fs::write(vad_dir.join(VAD_FILE_NAME), []).unwrap();
-        assert!(store.model_ready(ModelKind::Vad));
+        assert!(!store.model_ready(ModelKind::Vad));
+    }
+
+    #[test]
+    fn vad_ready_requires_valid_checksum() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(&ModelOptions {
+            model_dir: Some(dir.path().join("models")),
+            model_cache_dir: Some(dir.path().join("cache")),
+            revision: DEFAULT_REVISION.to_string(),
+        });
+        let vad_dir = store.model_dir(ModelKind::Vad);
+        std::fs::create_dir_all(&vad_dir).unwrap();
+        std::fs::write(vad_dir.join(VAD_FILE_NAME), []).unwrap();
+        assert_eq!(store.missing_models(), vec![ModelKind::Asr, ModelKind::Vad]);
+    }
+
+    #[test]
+    fn vad_temporary_path_does_not_overlap_target_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("models");
+        let store = ModelStore::new(&ModelOptions {
+            model_dir: Some(root.clone()),
+            model_cache_dir: Some(root),
+            revision: DEFAULT_REVISION.to_string(),
+        });
+        let target = store.model_dir(ModelKind::Vad).join(VAD_FILE_NAME);
+        assert_ne!(vad_temporary_path(&target), target);
+        assert_eq!(
+            vad_temporary_path(&target).file_name().unwrap(),
+            "silero_vad.onnx.download"
+        );
     }
 
     #[test]

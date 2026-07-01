@@ -1,6 +1,5 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
@@ -13,7 +12,7 @@ use crate::dataset::DatasetRecorder;
 use crate::hotkey::{HotkeyAction, HotkeyConfig, HotkeyManager, recv_action};
 use crate::inject::{InjectMethod, type_text};
 use crate::models::ModelStore;
-use crate::overlay::{OverlayHandle, OverlayMode, OverlayState, start as start_overlay};
+use crate::overlay::{OverlayHandle, OverlayMode, OverlayState, create as create_overlay};
 use crate::vad::{SpeechSegment, VadConfig, VadSegmenter};
 
 #[derive(Clone, Debug)]
@@ -45,9 +44,28 @@ pub async fn run_daemon(store: ModelStore, options: DaemonOptions) -> Result<()>
         return Err(error);
     }
 
-    let overlay = start_overlay().context("无法启动悬浮窗")?;
+    let (overlay, overlay_runner) = create_overlay();
     overlay.idle();
+    let daemon_overlay = overlay.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Err(error) = run_daemon_loop(store, options, daemon_overlay) {
+            error!(%error, "daemon 运行失败");
+            overlay.set(OverlayState {
+                mode: OverlayMode::Error {
+                    message: error.to_string(),
+                },
+            });
+        }
+    });
 
+    overlay_runner.run().context("无法启动悬浮窗")
+}
+
+fn run_daemon_loop(
+    store: ModelStore,
+    options: DaemonOptions,
+    overlay: OverlayHandle,
+) -> Result<()> {
     let engine = AsrEngine::load(store.clone())?;
     let mut segmenter = build_segmenter(&options, &store)?;
     let dataset = if options.save_dataset {
@@ -75,7 +93,7 @@ pub async fn run_daemon(store: ModelStore, options: DaemonOptions) -> Result<()>
     let state_worker = state.clone();
     let inject_method = options.inject_method.clone();
     let append_newline = options.append_newline;
-    thread::spawn(move || {
+    tokio::task::spawn_blocking(move || {
         transcription_worker(
             engine,
             dataset,
@@ -165,6 +183,7 @@ pub async fn run_daemon(store: ModelStore, options: DaemonOptions) -> Result<()>
 }
 
 fn build_segmenter(options: &DaemonOptions, store: &ModelStore) -> Result<VadSegmenter> {
+    store.verify_vad_checksum()?;
     let model_path = store.vad_model_path()?;
     VadSegmenter::new(
         VadConfig {
