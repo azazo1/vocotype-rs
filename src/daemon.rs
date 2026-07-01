@@ -286,6 +286,12 @@ fn transcription_worker(
                     },
                 });
             }
+        } else if result.is_empty_transcription() {
+            overlay.set(OverlayState {
+                mode: OverlayMode::Done {
+                    text: "未识别到内容".to_string(),
+                },
+            });
         } else {
             let duration_label = format!("{:.2}", result.duration);
             warn!(

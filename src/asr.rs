@@ -11,6 +11,7 @@ use crate::models::{AsrModelFiles, ModelStore};
 use crate::wav::PcmAudio;
 
 pub const TARGET_SAMPLE_RATE: u32 = 16_000;
+pub const EMPTY_TRANSCRIPTION_MESSAGE: &str = "没有识别到文本";
 
 #[derive(Clone, Debug, Serialize)]
 pub struct TranscriptionResult {
@@ -21,6 +22,14 @@ pub struct TranscriptionResult {
     pub inference_latency: f32,
     pub confidence: f32,
     pub error: Option<String>,
+}
+
+impl TranscriptionResult {
+    pub fn is_empty_transcription(&self) -> bool {
+        !self.success
+            && self.text.trim().is_empty()
+            && self.error.as_deref() == Some(EMPTY_TRANSCRIPTION_MESSAGE)
+    }
 }
 
 pub struct AsrEngine {
@@ -95,7 +104,7 @@ impl AsrEngine {
             error: if success {
                 None
             } else {
-                Some("没有识别到文本".to_string())
+                Some(EMPTY_TRANSCRIPTION_MESSAGE.to_string())
             },
         })
     }

@@ -4488,6 +4488,9 @@ dependencies = [
  "futures-util",
  "global-hotkey",
  "hound",
+ "objc2 0.5.2",
+ "objc2-app-kit 0.2.2",
+ "raw-window-handle",
  "reqwest",
  "serde",
  "serde_json",
@@ -4503,6 +4506,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "walkdir",
+ "winit",
 ]
 
 [[package]]
