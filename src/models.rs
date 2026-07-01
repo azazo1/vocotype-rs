@@ -339,14 +339,14 @@ async fn download_to_file(url: &str, path: &Path) -> Result<()> {
 
 fn download_bar_style() -> ProgressStyle {
     ProgressStyle::with_template(
-        "{spinner:.green} {wide_msg} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} {bytes_per_sec} eta {eta}",
+        "{spinner:.green} 下载 [{elapsed_precise}] [{bar:32.cyan/blue}] {bytes}/{total_bytes} {bytes_per_sec} eta {eta}",
     )
     .unwrap_or_else(|_| ProgressStyle::default_bar())
     .progress_chars("=>-")
 }
 
 fn download_spinner_style() -> ProgressStyle {
-    ProgressStyle::with_template("{spinner:.green} {wide_msg} [{elapsed_precise}] {bytes} {bytes_per_sec}")
+    ProgressStyle::with_template("{spinner:.green} 下载 [{elapsed_precise}] {bytes} {bytes_per_sec}")
         .unwrap_or_else(|_| ProgressStyle::default_spinner())
 }
 
@@ -382,33 +382,69 @@ fn format_bytes(bytes: u64) -> String {
 fn extract_tar_bz2(archive: &Path, target_dir: &Path) -> Result<()> {
     let file = File::open(archive)
         .with_context(|| format!("无法打开模型压缩包: {}", archive.display()))?;
-    let decoder = BzDecoder::new(file);
-    let mut tar = tar::Archive::new(decoder);
+    let total_bytes = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+    let span = extract_span(archive, total_bytes);
+    let _enter = span.enter();
+    let mut reader = ProgressRead::new(file, &span);
 
-    for entry in tar.entries()? {
-        let mut entry = entry?;
-        let path = entry.path()?.to_path_buf();
-        let stripped = strip_archive_root(&path);
-        if stripped.as_os_str().is_empty() || !safe_relative_path(&stripped) {
-            continue;
-        }
+    {
+        let decoder = BzDecoder::new(&mut reader);
+        let mut tar = tar::Archive::new(decoder);
 
-        let output = target_dir.join(stripped);
-        let entry_type = entry.header().entry_type();
-        if entry_type.is_dir() {
-            std::fs::create_dir_all(&output)
-                .with_context(|| format!("无法创建模型目录: {}", output.display()))?;
-        } else if entry_type.is_file() {
-            crate::app::ensure_parent(&output)?;
-            entry
-                .unpack(&output)
-                .with_context(|| format!("无法解压模型文件: {}", output.display()))?;
-        } else {
-            debug!(path = %output.display(), "跳过非普通模型文件");
+        for entry in tar.entries()? {
+            let mut entry = entry?;
+            let path = entry.path()?.to_path_buf();
+            let stripped = strip_archive_root(&path);
+            if stripped.as_os_str().is_empty() || !safe_relative_path(&stripped) {
+                continue;
+            }
+
+            let output = target_dir.join(stripped);
+            let entry_type = entry.header().entry_type();
+            if entry_type.is_dir() {
+                std::fs::create_dir_all(&output)
+                    .with_context(|| format!("无法创建模型目录: {}", output.display()))?;
+            } else if entry_type.is_file() {
+                crate::app::ensure_parent(&output)?;
+                entry
+                    .unpack(&output)
+                    .with_context(|| format!("无法解压模型文件: {}", output.display()))?;
+            } else {
+                debug!(path = %output.display(), "跳过非普通模型文件");
+            }
         }
     }
 
+    reader.flush();
+    span.pb_set_finish_message(&format!(
+        "解压完成 {} {}",
+        archive
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("model"),
+        format_bytes(total_bytes)
+    ));
     Ok(())
+}
+
+fn extract_span(archive: &Path, total_bytes: u64) -> tracing::Span {
+    let span = tracing::info_span!(
+        "解压模型",
+        indicatif.pb_show = tracing::field::Empty,
+        path = %archive.display(),
+    );
+    span.pb_set_length(total_bytes);
+    span.pb_set_style(&extract_bar_style());
+    span.pb_start();
+    span
+}
+
+fn extract_bar_style() -> ProgressStyle {
+    ProgressStyle::with_template(
+        "{spinner:.green} 解压 [{elapsed_precise}] [{bar:32.yellow/blue}] {bytes}/{total_bytes} {bytes_per_sec} eta {eta}",
+    )
+    .unwrap_or_else(|_| ProgressStyle::default_bar())
+    .progress_chars("=>-")
 }
 
 fn strip_archive_root(path: &Path) -> PathBuf {
@@ -513,7 +549,7 @@ fn checksum_span(kind: ModelKind, dir: &Path, total_bytes: u64) -> tracing::Span
 
 fn checksum_bar_style() -> ProgressStyle {
     ProgressStyle::with_template(
-        "{spinner:.green} sha256 {wide_msg} [{elapsed_precise}] [{wide_bar:.magenta/blue}] {bytes}/{total_bytes} {bytes_per_sec} eta {eta}",
+        "{spinner:.green} sha256 [{elapsed_precise}] [{bar:32.magenta/blue}] {bytes}/{total_bytes} {bytes_per_sec} eta {eta}",
     )
     .unwrap_or_else(|_| ProgressStyle::default_bar())
     .progress_chars("=>-")
@@ -574,6 +610,34 @@ impl<'a> ProgressThrottle<'a> {
             self.span.pb_set_message(message);
         }
         self.last_update = Instant::now();
+    }
+}
+
+struct ProgressRead<'a, R> {
+    inner: R,
+    progress: ProgressThrottle<'a>,
+}
+
+impl<'a, R> ProgressRead<'a, R> {
+    fn new(inner: R, span: &'a tracing::Span) -> Self {
+        Self {
+            inner,
+            progress: ProgressThrottle::new(span),
+        }
+    }
+
+    fn flush(&mut self) {
+        self.progress.flush(None);
+    }
+}
+
+impl<R: Read> Read for ProgressRead<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        if read > 0 {
+            self.progress.add(read as u64, None);
+        }
+        Ok(read)
     }
 }
 
