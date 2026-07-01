@@ -12,6 +12,7 @@ pub(crate) struct OverlayApp {
     state: Arc<Mutex<OverlayState>>,
     receiver: Receiver<OverlayState>,
     visible: bool,
+    initial_hide_sent: bool,
     hide_at: Option<Instant>,
 }
 
@@ -21,7 +22,15 @@ impl OverlayApp {
             state,
             receiver,
             visible: false,
+            initial_hide_sent: false,
             hide_at: None,
+        }
+    }
+
+    fn ensure_initial_hidden(&mut self, ctx: &egui::Context) {
+        if !self.initial_hide_sent {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            self.initial_hide_sent = true;
         }
     }
 
@@ -66,9 +75,10 @@ impl OverlayApp {
     }
 
     fn hide(&mut self, ctx: &egui::Context) {
-        if self.visible {
+        if self.visible || !self.initial_hide_sent {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             self.visible = false;
+            self.initial_hide_sent = true;
         }
     }
 
@@ -82,6 +92,7 @@ impl OverlayApp {
 
 impl eframe::App for OverlayApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.ensure_initial_hidden(ctx);
         self.drain_updates(ctx);
         self.handle_auto_hide(ctx);
 

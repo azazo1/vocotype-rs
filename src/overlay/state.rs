@@ -10,7 +10,10 @@ pub enum OverlayMode {
 
 impl OverlayMode {
     pub(crate) fn is_visible(&self) -> bool {
-        !matches!(self, Self::Idle)
+        !matches!(
+            self,
+            Self::Idle | Self::Transcribing { pending: 0 }
+        )
     }
 
     pub(crate) fn is_done(&self) -> bool {

@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::asr::{AsrEngine, TARGET_SAMPLE_RATE, TranscriptionResult};
 use crate::audio::AudioInput;
@@ -119,7 +119,7 @@ fn run_daemon_loop(
                 let event = event.context("热键事件通道已关闭")?;
                 match recv_action(event) {
                     HotkeyAction::Pressed if !capturing => {
-                        info!("热键按下, 开始录音");
+                        debug!("热键按下, 开始录音");
                         let input = AudioInput::start(None)?;
                         audio_rx = Some(input.receiver());
                         audio_input = Some(input);
@@ -130,7 +130,7 @@ fn run_daemon_loop(
                         overlay.set(OverlayState { mode: OverlayMode::Recording { level: 0.0 } });
                     }
                     HotkeyAction::Released if capturing => {
-                        info!("热键释放, 结束录音");
+                        debug!("热键释放, 结束录音");
                         capturing = false;
                         set_recording(&state, false);
                         for segment in segmenter.finish() {
@@ -140,7 +140,13 @@ fn run_daemon_loop(
                             input.stop();
                         }
                         audio_rx = None;
-                        overlay.set(OverlayState { mode: OverlayMode::Transcribing { pending: pending_count(&state) } });
+                        let pending = pending_count(&state);
+                        let mode = if pending == 0 {
+                            OverlayMode::Idle
+                        } else {
+                            OverlayMode::Transcribing { pending }
+                        };
+                        overlay.set(OverlayState { mode });
                     }
                     _ => {}
                 }
