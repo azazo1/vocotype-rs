@@ -42,11 +42,6 @@ pub fn type_text(text: &str, append_newline: bool, method: InjectMethod) -> Resu
     match method {
         InjectMethod::Type => direct_type(&payload),
         InjectMethod::Clipboard => clipboard_paste(&payload),
-        InjectMethod::Auto if should_prefer_clipboard(&payload) => clipboard_paste(&payload)
-            .or_else(|error| {
-                warn!(%error, "剪贴板粘贴失败, 尝试直接输入");
-                direct_type(&payload)
-            }),
         InjectMethod::Auto => direct_type(&payload).or_else(|error| {
             warn!(%error, "直接输入失败, 尝试剪贴板粘贴");
             clipboard_paste(&payload)
@@ -54,15 +49,7 @@ pub fn type_text(text: &str, append_newline: bool, method: InjectMethod) -> Resu
     }
 }
 
-fn should_prefer_clipboard(text: &str) -> bool {
-    !text.is_ascii()
-}
-
 fn direct_type(text: &str) -> Result<()> {
-    if should_prefer_clipboard(text) {
-        bail!("直接输入不适合非 ASCII 文本");
-    }
-
     run_enigo("直接输入", |enigo| {
         enigo.text(text)
     })
