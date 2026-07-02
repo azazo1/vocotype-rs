@@ -37,7 +37,7 @@ fn missing_models_reports_required_kinds() {
         revision: DEFAULT_REVISION.to_string(),
     });
     let missing = store.missing_models();
-    assert_eq!(missing, vec![ModelKind::Asr, ModelKind::Vad]);
+    assert_eq!(missing, vec![ModelKind::Asr, ModelKind::Vad, ModelKind::Punc]);
 }
 
 #[test]
@@ -97,7 +97,25 @@ fn vad_ready_requires_valid_checksum() {
     let vad_dir = store.model_dir(ModelKind::Vad);
     std::fs::create_dir_all(&vad_dir).unwrap();
     std::fs::write(vad_dir.join(VAD_FILE_NAME), []).unwrap();
-    assert_eq!(store.missing_models(), vec![ModelKind::Asr, ModelKind::Vad]);
+    assert_eq!(
+        store.missing_models(),
+        vec![ModelKind::Asr, ModelKind::Vad, ModelKind::Punc]
+    );
+}
+
+#[test]
+fn punc_ready_requires_onnx_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = ModelStore::new(&ModelOptions {
+        model_dir: Some(dir.path().join("models")),
+        model_cache_dir: Some(dir.path().join("cache")),
+        revision: DEFAULT_REVISION.to_string(),
+    });
+    let punc_dir = store.model_dir(ModelKind::Punc);
+    std::fs::create_dir_all(&punc_dir).unwrap();
+    assert!(!store.model_ready(ModelKind::Punc));
+    std::fs::write(punc_dir.join("model.int8.onnx"), []).unwrap();
+    assert!(store.model_ready(ModelKind::Punc));
 }
 
 #[test]

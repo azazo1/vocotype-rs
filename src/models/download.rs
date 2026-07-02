@@ -11,7 +11,7 @@ use super::checksum::sha256_file_without_progress;
 use super::progress::{ProgressThrottle, format_bytes};
 use super::{
     ASR_MODEL_NAME, ASR_MODEL_URL, ModelKind, ModelManifest, ModelStore, VAD_FILE_NAME,
-    VAD_MODEL_URL, VAD_SHA256,
+    PUNC_MODEL_NAME, PUNC_MODEL_URL, VAD_MODEL_URL, VAD_SHA256,
 };
 
 impl ModelStore {
@@ -35,6 +35,7 @@ impl ModelStore {
         match kind {
             ModelKind::Asr => self.download_asr(&target_dir).await,
             ModelKind::Vad => self.download_vad(&target_dir).await,
+            ModelKind::Punc => self.download_punc(&target_dir).await,
         }
     }
 
@@ -74,6 +75,23 @@ impl ModelStore {
         std::fs::rename(&temporary, &target)
             .with_context(|| format!("无法保存 VAD 模型到 {}", target.display()))?;
         info!(path = %target.display(), "VAD 模型下载完成");
+        Ok(())
+    }
+
+    async fn download_punc(&self, target_dir: &Path) -> Result<()> {
+        let archive = self
+            .paths
+            .cache_entry_dir(PUNC_MODEL_NAME)
+            .with_extension("tar.bz2");
+        crate::app::ensure_parent(&archive)?;
+        info!(url = PUNC_MODEL_URL, path = %archive.display(), "开始下载 PUNC 模型");
+        download_to_file(PUNC_MODEL_URL, &archive).await?;
+        extract_tar_bz2(&archive, target_dir)?;
+        if !self.model_ready(ModelKind::Punc) {
+            warn!(path = %target_dir.display(), "PUNC 模型解压后缺少 onnx 模型");
+            bail!("PUNC 模型下载不完整");
+        }
+        info!(path = %target_dir.display(), "PUNC 模型下载完成");
         Ok(())
     }
 }

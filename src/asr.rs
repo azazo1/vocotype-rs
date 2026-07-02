@@ -4,10 +4,13 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
-use sherpa_onnx::{OfflineParaformerModelConfig, OfflineRecognizer, OfflineRecognizerConfig};
-use tracing::{debug, info};
+use sherpa_onnx::{
+    OfflineParaformerModelConfig, OfflinePunctuation, OfflinePunctuationConfig, OfflineRecognizer,
+    OfflineRecognizerConfig,
+};
+use tracing::{debug, info, warn};
 
-use crate::models::{AsrModelFiles, ModelStore};
+use crate::models::{AsrModelFiles, ModelStore, PuncModelFiles};
 use crate::wav::PcmAudio;
 
 pub const TARGET_SAMPLE_RATE: u32 = 16_000;
@@ -34,19 +37,29 @@ impl TranscriptionResult {
 
 pub struct AsrEngine {
     recognizer: OfflineRecognizer,
+    punctuator: OfflinePunctuation,
 }
 
 impl AsrEngine {
     pub fn load(store: ModelStore) -> Result<Arc<Self>> {
         store.verify_required()?;
-        let files = store.asr_model_files()?;
-        let recognizer = create_recognizer(&files)?;
+        let asr_files = store.asr_model_files()?;
+        let punc_files = store.punc_model_files()?;
+        let recognizer = create_recognizer(&asr_files)?;
+        let punctuator = create_punctuator(&punc_files)?;
         info!(
-            model = %files.model.display(),
-            tokens = %files.tokens.display(),
+            model = %asr_files.model.display(),
+            tokens = %asr_files.tokens.display(),
             "ASR 模型加载完成"
         );
-        Ok(Arc::new(Self { recognizer }))
+        info!(
+            model = %punc_files.model.display(),
+            "PUNC 模型加载完成"
+        );
+        Ok(Arc::new(Self {
+            recognizer,
+            punctuator,
+        }))
     }
 
     pub fn transcribe_file(&self, audio: &Path) -> Result<TranscriptionResult> {
@@ -72,17 +85,22 @@ impl AsrEngine {
         let result = stream
             .get_result()
             .ok_or_else(|| anyhow!("ASR 解码没有返回结果"))?;
-        let text = result.text.trim().to_string();
+        let raw_text = result.text.trim().to_string();
         let latency = start.elapsed().as_secs_f32();
         let duration = audio.duration_seconds();
         let duration_label = format!("{:.2}", duration);
         let latency_label = format!("{:.2}", latency);
-        let success = !text.is_empty();
+        let success = !raw_text.is_empty();
+        let text = if success {
+            self.restore_punctuation(&raw_text)
+        } else {
+            raw_text.clone()
+        };
         if success {
             info!(
                 duration = %duration_label,
                 latency = %latency_label,
-                chars = text.chars().count(),
+                chars = raw_text.chars().count(),
                 text = %text,
                 "ASR 转写完成"
             );
@@ -97,7 +115,7 @@ impl AsrEngine {
         Ok(TranscriptionResult {
             success,
             text: text.clone(),
-            raw_text: text,
+            raw_text,
             duration,
             inference_latency: latency,
             confidence: if success { 1.0 } else { 0.0 },
@@ -107,6 +125,16 @@ impl AsrEngine {
                 Some(EMPTY_TRANSCRIPTION_MESSAGE.to_string())
             },
         })
+    }
+
+    fn restore_punctuation(&self, text: &str) -> String {
+        match self.punctuator.add_punctuation(text) {
+            Some(text) => text.trim().to_string(),
+            None => {
+                warn!("标点恢复失败, 使用原始转写文本");
+                text.to_string()
+            }
+        }
     }
 }
 
@@ -128,7 +156,21 @@ fn create_recognizer(files: &AsrModelFiles) -> Result<OfflineRecognizer> {
     })
 }
 
-fn path_string(path: &Path) -> Result<String> {
+fn create_punctuator(files: &PuncModelFiles) -> Result<OfflinePunctuation> {
+    let mut config = OfflinePunctuationConfig::default();
+    config.model.ct_transformer = Some(path_string(&files.model)?);
+    config.model.num_threads = 1;
+    config.model.provider = Some("cpu".to_string());
+
+    OfflinePunctuation::create(&config).with_context(|| {
+        format!(
+            "无法加载 sherpa PUNC 模型: model={}",
+            files.model.display()
+        )
+    })
+}
+
+pub(crate) fn path_string(path: &Path) -> Result<String> {
     path.to_str()
         .map(ToOwned::to_owned)
         .ok_or_else(|| anyhow!("路径不是有效 UTF-8: {}", path.display()))

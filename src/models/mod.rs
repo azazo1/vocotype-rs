@@ -17,7 +17,7 @@ mod progress;
 mod tests;
 
 use checksum::sha256_file_without_progress;
-use discovery::find_asr_model_file;
+use discovery::find_onnx_model_file;
 
 use crate::app::{AppPaths, env_path};
 
@@ -31,23 +31,28 @@ pub const VAD_FILE_NAME: &str = "silero_vad.onnx";
 pub const VAD_MODEL_URL: &str =
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx";
 pub const VAD_SHA256: &str = "9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6";
+pub const PUNC_MODEL_NAME: &str =
+    "sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8";
+pub const PUNC_MODEL_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/punctuation-models/sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8.tar.bz2";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ModelKind {
     Asr,
     Vad,
+    Punc,
 }
 
 impl ModelKind {
-    pub fn all() -> [Self; 2] {
-        [Self::Asr, Self::Vad]
+    pub fn all() -> [Self; 3] {
+        [Self::Asr, Self::Vad, Self::Punc]
     }
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Asr => "asr",
             Self::Vad => "vad",
+            Self::Punc => "punc",
         }
     }
 
@@ -55,6 +60,7 @@ impl ModelKind {
         match self {
             Self::Asr => ASR_MODEL_NAME,
             Self::Vad => VAD_MODEL_NAME,
+            Self::Punc => PUNC_MODEL_NAME,
         }
     }
 
@@ -62,6 +68,7 @@ impl ModelKind {
         match self {
             Self::Asr => ASR_MODEL_URL,
             Self::Vad => VAD_MODEL_URL,
+            Self::Punc => PUNC_MODEL_URL,
         }
     }
 }
@@ -105,6 +112,11 @@ pub struct ManifestModel {
 pub struct AsrModelFiles {
     pub model: PathBuf,
     pub tokens: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+pub struct PuncModelFiles {
+    pub model: PathBuf,
 }
 
 #[derive(Clone, Debug)]
@@ -155,6 +167,7 @@ impl ModelStore {
         match kind {
             ModelKind::Asr => self.asr_model_files().is_ok(),
             ModelKind::Vad => self.verify_vad_checksum().is_ok(),
+            ModelKind::Punc => self.punc_model_files().is_ok(),
         }
     }
 
@@ -164,7 +177,7 @@ impl ModelStore {
 
     pub fn asr_model_files(&self) -> Result<AsrModelFiles> {
         let dir = self.model_dir(ModelKind::Asr);
-        let model = find_asr_model_file(&dir)?;
+        let model = find_onnx_model_file("ASR", &dir)?;
         let tokens = dir.join("tokens.txt");
         if !tokens.exists() {
             bail!("ASR tokens 文件不存在: {}", tokens.display());
@@ -178,6 +191,12 @@ impl ModelStore {
             bail!("VAD 模型文件不存在: {}", path.display());
         }
         Ok(path)
+    }
+
+    pub fn punc_model_files(&self) -> Result<PuncModelFiles> {
+        let dir = self.model_dir(ModelKind::Punc);
+        let model = find_onnx_model_file("PUNC", &dir)?;
+        Ok(PuncModelFiles { model })
     }
 
     pub fn verify_vad_checksum(&self) -> Result<()> {

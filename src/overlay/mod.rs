@@ -31,9 +31,7 @@ impl OverlayHandle {
     }
 
     pub fn idle(&self) {
-        self.set(OverlayState {
-            mode: OverlayMode::Idle,
-        });
+        self.set(OverlayState::new(OverlayMode::Idle));
     }
 }
 

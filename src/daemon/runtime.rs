@@ -9,13 +9,15 @@ use crate::audio::AudioInput;
 use crate::dataset::DatasetRecorder;
 use crate::hotkey::{HotkeyAction, HotkeyConfig, HotkeyManager, recv_action};
 use crate::models::ModelStore;
-use crate::overlay::{OverlayHandle, OverlayMode, OverlayState};
+use crate::overlay::{OverlayHandle, OverlayMode};
 
 use super::DaemonOptions;
 use super::segments::{
     build_segmenter, drain_release_tail, frame_level, submit_segment,
 };
-use super::state::{new_state, pending_count, set_recording};
+use super::state::{
+    begin_recording_session, end_recording_session, new_state, overlay_state, pending_count,
+};
 use super::worker::transcription_worker;
 
 pub(super) fn run_daemon_loop(
@@ -79,13 +81,13 @@ pub(super) fn run_daemon_loop(
                         segmenter.reset();
                         capturing = true;
                         last_frame_at = Instant::now();
-                        set_recording(&state, true);
-                        overlay.set(OverlayState { mode: OverlayMode::Recording { level: 0.0 } });
+                        begin_recording_session(&state);
+                        overlay.set(overlay_state(&state, OverlayMode::Recording { level: 0.0 }));
                     }
                     HotkeyAction::Released if capturing => {
                         debug!("热键释放, 结束录音");
                         capturing = false;
-                        set_recording(&state, false);
+                        end_recording_session(&state);
                         if let Some(rx) = &audio_rx {
                             drain_release_tail(
                                 rx,
@@ -109,7 +111,7 @@ pub(super) fn run_daemon_loop(
                         } else {
                             OverlayMode::Transcribing { pending }
                         };
-                        overlay.set(OverlayState { mode });
+                        overlay.set(overlay_state(&state, mode));
                     }
                     _ => {}
                 }
@@ -125,20 +127,23 @@ pub(super) fn run_daemon_loop(
                             } else {
                                 OverlayMode::Silence { pending: pending_count(&state) }
                             };
-                            overlay.set(OverlayState { mode });
+                            overlay.set(overlay_state(&state, mode));
                             for segment in segmenter.push(&frame) {
                                 submit_segment(&segment_tx, &state, &overlay, segment)?;
                             }
                         }
                         Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                             if last_frame_at.elapsed() > Duration::from_millis(options.end_silence_ms as u64) {
-                                overlay.set(OverlayState { mode: OverlayMode::Silence { pending: pending_count(&state) } });
+                                overlay.set(overlay_state(
+                                    &state,
+                                    OverlayMode::Silence { pending: pending_count(&state) },
+                                ));
                             }
                         }
                         Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                             warn!("音频流断开");
                             capturing = false;
-                            set_recording(&state, false);
+                            end_recording_session(&state);
                             if let Some(input) = audio_input.take() {
                                 input.stop();
                             }

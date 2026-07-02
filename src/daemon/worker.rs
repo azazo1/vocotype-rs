@@ -6,10 +6,12 @@ use tracing::{error, warn};
 use crate::asr::{AsrEngine, TARGET_SAMPLE_RATE, TranscriptionResult};
 use crate::dataset::DatasetRecorder;
 use crate::inject::{InjectMethod, type_text};
-use crate::overlay::{OverlayHandle, OverlayMode, OverlayState};
+use crate::overlay::{OverlayHandle, OverlayMode};
 use crate::vad::SpeechSegment;
 
-use super::state::{SharedRuntimeState, finish_queue_item};
+use super::state::{
+    SharedRuntimeState, final_mode, finish_queue_item, overlay_state_with_lines,
+};
 
 pub(super) fn transcription_worker(
     engine: Arc<AsrEngine>,
@@ -44,8 +46,9 @@ pub(super) fn transcription_worker(
             warn!(%error, "数据集记录失败");
         }
 
-        let remaining = match finish_queue_item(&state, result.text.clone()) {
-            Ok(remaining) => remaining,
+        let transcript = result.success.then_some(result.text.as_str());
+        let (remaining, transcript_lines) = match finish_queue_item(&state, transcript) {
+            Ok(result) => result,
             Err(error) => {
                 error!(%error);
                 continue;
@@ -54,20 +57,23 @@ pub(super) fn transcription_worker(
 
         if result.success {
             if let Err(error) = type_text(&result.text, append_newline, inject_method.clone()) {
-                overlay.set(OverlayState {
-                    mode: OverlayMode::Error {
+                overlay.set(overlay_state_with_lines(
+                    OverlayMode::Error {
                         message: format!("文本注入失败: {}", error),
                     },
-                });
+                    transcript_lines,
+                ));
             } else {
-                overlay.set(OverlayState {
-                    mode: final_result_mode(remaining, result.text.clone()),
-                });
+                overlay.set(overlay_state_with_lines(
+                    final_mode(remaining),
+                    transcript_lines,
+                ));
             }
         } else if result.is_empty_transcription() {
-            overlay.set(OverlayState {
-                mode: final_result_mode(remaining, "未识别到内容".to_string()),
-            });
+            overlay.set(overlay_state_with_lines(
+                final_mode(remaining),
+                transcript_lines,
+            ));
         } else {
             let duration_label = format!("{:.2}", result.duration);
             warn!(
@@ -75,22 +81,15 @@ pub(super) fn transcription_worker(
                 duration = %duration_label,
                 "语音段转写失败"
             );
-            overlay.set(OverlayState {
-                mode: OverlayMode::Error {
+            overlay.set(overlay_state_with_lines(
+                OverlayMode::Error {
                     message: result
                         .error
                         .clone()
                         .unwrap_or_else(|| "转写失败".to_string()),
                 },
-            });
+                transcript_lines,
+            ));
         }
-    }
-}
-
-fn final_result_mode(remaining: usize, text: String) -> OverlayMode {
-    if remaining == 0 {
-        OverlayMode::Done { text }
-    } else {
-        OverlayMode::Transcribing { pending: remaining }
     }
 }

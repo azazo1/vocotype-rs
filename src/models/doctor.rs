@@ -1,6 +1,7 @@
 use std::io::Write;
 
 use anyhow::Result;
+use sherpa_onnx::{OfflinePunctuation, OfflinePunctuationConfig};
 
 use super::{ModelKind, ModelStore};
 
@@ -40,7 +41,13 @@ pub fn loadability_report(store: &ModelStore, mut writer: impl Write) -> Result<
     store.verify_vad_checksum()?;
     let vad_model = store.vad_model_path()?;
     let _vad = crate::vad::VadSegmenter::new(crate::vad::VadConfig::default(), &vad_model)?;
+    let punc_files = store.punc_model_files()?;
+    let mut punc_config = OfflinePunctuationConfig::default();
+    punc_config.model.ct_transformer = Some(crate::asr::path_string(&punc_files.model)?);
+    let _punc = OfflinePunctuation::create(&punc_config)
+        .ok_or_else(|| anyhow::anyhow!("无法加载 sherpa PUNC 模型: {}", punc_files.model.display()))?;
     writeln!(writer, "sherpa_asr=loadable")?;
     writeln!(writer, "sherpa_vad=loadable")?;
+    writeln!(writer, "sherpa_punc=loadable")?;
     Ok(())
 }

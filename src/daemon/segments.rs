@@ -5,11 +5,11 @@ use crossbeam_channel::{Receiver, Sender};
 use tracing::info;
 
 use crate::models::ModelStore;
-use crate::overlay::{OverlayHandle, OverlayMode, OverlayState};
+use crate::overlay::{OverlayHandle, OverlayMode};
 use crate::vad::{SpeechSegment, VadConfig, VadSegmenter};
 
 use super::DaemonOptions;
-use super::state::{SharedRuntimeState, increment_queue};
+use super::state::{SharedRuntimeState, increment_queue, overlay_state};
 
 pub(super) fn build_segmenter(
     options: &DaemonOptions,
@@ -47,9 +47,7 @@ pub(super) fn submit_segment(
     );
 
     let pending = increment_queue(state)?;
-    overlay.set(OverlayState {
-        mode: OverlayMode::Transcribing { pending },
-    });
+    overlay.set(overlay_state(state, OverlayMode::Transcribing { pending }));
     segment_tx
         .send(segment)
         .map_err(|error| anyhow!("无法提交转写任务: {}", error))?;

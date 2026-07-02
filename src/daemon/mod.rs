@@ -40,11 +40,11 @@ pub async fn run_daemon(store: ModelStore, options: DaemonOptions) -> Result<()>
     tokio::task::spawn_blocking(move || {
         if let Err(error) = runtime::run_daemon_loop(store, options, daemon_overlay) {
             error!(%error, "daemon 运行失败");
-            overlay.set(OverlayState {
-                mode: OverlayMode::Error {
+            overlay.set(OverlayState::new(
+                OverlayMode::Error {
                     message: error.to_string(),
                 },
-            });
+            ));
         }
     });
 
