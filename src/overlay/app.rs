@@ -3,16 +3,19 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
 
+use super::platform;
 use super::state::{OverlayMode, OverlayState};
 
 const REPAINT_INTERVAL: Duration = Duration::from_millis(80);
 const DONE_VISIBLE_FOR: Duration = Duration::from_millis(1_400);
+const ERROR_HIDE_AFTER_LEAVE: Duration = Duration::from_millis(700);
 const MIN_WIDTH: f32 = 360.0;
 const MAX_WIDTH: f32 = 560.0;
 const BASE_HEIGHT: f32 = 108.0;
 const MAX_HEIGHT: f32 = 420.0;
 const TEXT_LINE_HEIGHT: f32 = 21.0;
 const TEXT_CHARS_PER_LINE: usize = 32;
+const SCREEN_MARGIN: f32 = 24.0;
 
 pub(crate) struct OverlayApp {
     state: Arc<Mutex<OverlayState>>,
@@ -20,6 +23,9 @@ pub(crate) struct OverlayApp {
     visible: bool,
     initial_hide_sent: bool,
     hide_at: Option<Instant>,
+    mouse_passthrough: bool,
+    error_hovered: bool,
+    error_was_hovered: bool,
 }
 
 impl OverlayApp {
@@ -30,6 +36,9 @@ impl OverlayApp {
             visible: false,
             initial_hide_sent: false,
             hide_at: None,
+            mouse_passthrough: true,
+            error_hovered: false,
+            error_was_hovered: false,
         }
     }
 
@@ -51,16 +60,26 @@ impl OverlayApp {
 
     fn apply_visibility(&mut self, ctx: &egui::Context, state: &OverlayState) {
         if state.is_visible() {
-            self.resize(ctx, state);
+            let size = overlay_size(state);
+            self.resize(ctx, size);
+            self.reposition(ctx, size);
             self.show(ctx);
+            self.set_mouse_passthrough(ctx, !state.is_error());
             self.hide_at = if state.is_done() {
                 Some(Instant::now() + DONE_VISIBLE_FOR)
             } else {
                 None
             };
+            if !state.is_error() {
+                self.error_hovered = false;
+                self.error_was_hovered = false;
+            }
         } else {
             self.hide(ctx);
             self.hide_at = None;
+            self.set_mouse_passthrough(ctx, true);
+            self.error_hovered = false;
+            self.error_was_hovered = false;
         }
     }
 
@@ -73,6 +92,25 @@ impl OverlayApp {
             self.clear_state();
             self.hide_at = None;
         }
+    }
+
+    fn handle_error_hover(&mut self, ctx: &egui::Context) {
+        if !self.visible || !self.current_state().is_error() {
+            return;
+        }
+
+        let hovered = ctx.pointer_hover_pos().is_some();
+        match (self.error_hovered, hovered) {
+            (false, true) => {
+                self.error_was_hovered = true;
+                self.hide_at = None;
+            }
+            (true, false) if self.error_was_hovered => {
+                self.hide_at = Some(Instant::now() + ERROR_HIDE_AFTER_LEAVE);
+            }
+            _ => {}
+        }
+        self.error_hovered = hovered;
     }
 
     fn show(&mut self, ctx: &egui::Context) {
@@ -90,9 +128,23 @@ impl OverlayApp {
         }
     }
 
-    fn resize(&self, ctx: &egui::Context, state: &OverlayState) {
-        let size = overlay_size(state);
+    fn resize(&self, ctx: &egui::Context, size: egui::Vec2) {
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+    }
+
+    fn reposition(&self, ctx: &egui::Context, size: egui::Vec2) {
+        if let Some(screen_rect) = platform::current_mouse_screen_rect() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
+                overlay_position(screen_rect, size),
+            ));
+        }
+    }
+
+    fn set_mouse_passthrough(&mut self, ctx: &egui::Context, passthrough: bool) {
+        if self.mouse_passthrough != passthrough {
+            ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(passthrough));
+            self.mouse_passthrough = passthrough;
+        }
     }
 
     fn current_state(&self) -> OverlayState {
@@ -113,20 +165,22 @@ impl eframe::App for OverlayApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.ensure_initial_hidden(ctx);
         self.drain_updates(ctx);
+        self.handle_error_hover(ctx);
         self.handle_auto_hide(ctx);
         ctx.request_repaint_after(REPAINT_INTERVAL);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         if self.visible {
-            draw_overlay(ui, &self.current_state());
+            draw_overlay(ui, &self.current_state(), self.error_hovered);
         }
     }
 }
 
-fn draw_overlay(ui: &mut egui::Ui, state: &OverlayState) {
+fn draw_overlay(ui: &mut egui::Ui, state: &OverlayState, error_hovered: bool) {
+    let fill = overlay_fill(state, error_hovered);
     egui::CentralPanel::default()
-        .frame(egui::Frame::new().fill(egui::Color32::from_rgb(24, 28, 33)))
+        .frame(egui::Frame::new().fill(fill))
         .show(ui, |ui| {
             ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
             ui.add_space(8.0);
@@ -138,6 +192,16 @@ fn draw_overlay(ui: &mut egui::Ui, state: &OverlayState) {
                 });
             });
         });
+}
+
+fn overlay_fill(state: &OverlayState, error_hovered: bool) -> egui::Color32 {
+    if state.is_error() && error_hovered {
+        egui::Color32::from_rgb(88, 35, 35)
+    } else if state.is_error() {
+        egui::Color32::from_rgb(52, 35, 35)
+    } else {
+        egui::Color32::from_rgb(24, 28, 33)
+    }
 }
 
 fn draw_status(ui: &mut egui::Ui, state: &OverlayState) {
@@ -188,6 +252,14 @@ fn overlay_size(state: &OverlayState) -> egui::Vec2 {
         MAX_WIDTH
     };
     egui::vec2(width, (BASE_HEIGHT + text_height).min(MAX_HEIGHT))
+}
+
+fn overlay_position(screen_rect: platform::ScreenRect, size: egui::Vec2) -> egui::Pos2 {
+    let available = (screen_rect.size - size).max(egui::Vec2::ZERO);
+    let margin = SCREEN_MARGIN.min(available.x).min(available.y);
+    let x = screen_rect.min.x + available.x - margin;
+    let y = screen_rect.min.y + margin;
+    egui::pos2(x, y)
 }
 
 fn visual_line_count(text: &str) -> usize {

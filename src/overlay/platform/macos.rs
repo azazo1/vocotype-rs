@@ -1,5 +1,7 @@
 use tracing::warn;
 
+use super::ScreenRect;
+
 pub(crate) fn configure_native_options(native_options: &mut eframe::NativeOptions) {
     native_options.event_loop_builder = Some(Box::new(|builder| {
         use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
@@ -12,6 +14,42 @@ pub(crate) fn configure_window(cc: &eframe::CreationContext<'_>) {
     if let Err(error) = configure_window_inner(cc) {
         warn!(%error, "无法应用 macOS 悬浮窗属性");
     }
+}
+
+pub(crate) fn current_mouse_screen_rect() -> Option<ScreenRect> {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSEvent, NSScreen};
+    use objc2_core_graphics::{CGDisplayBounds, CGMainDisplayID};
+
+    let mtm = MainThreadMarker::new()?;
+    let mouse = NSEvent::mouseLocation();
+    let screens = NSScreen::screens(mtm);
+    for index in 0..screens.len() {
+        let screen = unsafe { screens.objectAtIndex_unchecked(index) };
+        let frame = screen.frame();
+        let frame_min = frame.origin;
+        let frame_max = frame.max();
+        if mouse.x < frame_min.x
+            || mouse.x >= frame_max.x
+            || mouse.y < frame_min.y
+            || mouse.y >= frame_max.y
+        {
+            continue;
+        }
+
+        let visible_frame = screen.visibleFrame();
+        let main_frame = CGDisplayBounds(CGMainDisplayID());
+        let y =
+            main_frame.size.height - visible_frame.size.height - visible_frame.origin.y;
+        return Some(ScreenRect {
+            min: egui::pos2(visible_frame.origin.x as f32, y as f32),
+            size: egui::vec2(
+                visible_frame.size.width as f32,
+                visible_frame.size.height as f32,
+            ),
+        });
+    }
+    None
 }
 
 fn configure_window_inner(cc: &eframe::CreationContext<'_>) -> Result<(), String> {

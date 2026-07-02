@@ -66,6 +66,10 @@ impl OverlayState {
     pub(crate) fn is_done(&self) -> bool {
         matches!(self.mode, OverlayMode::Done)
     }
+
+    pub(crate) fn is_error(&self) -> bool {
+        matches!(self.mode, OverlayMode::Error { .. })
+    }
 }
 
 impl Default for OverlayState {
