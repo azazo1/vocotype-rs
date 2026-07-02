@@ -43,6 +43,37 @@ hotkey = "shift+alt+space"
 
 主键可以写功能键, 字母键和常见控制键, 例如 `F2`, `KeyQ`, `space`, `enter`, `escape`, `left`.
 
+## 热键模式
+
+`daemon.hotkey-mode` 控制录音开始和停止的方式.
+
+按住录音, 松开停止:
+
+```toml
+[daemon]
+hotkey = "ctrl+f2"
+hotkey-mode = "pressed"
+```
+
+按一次开始, 再按一次停止:
+
+```toml
+[daemon]
+hotkey = "ctrl+f2"
+hotkey-mode = "toggle"
+```
+
+使用触发键开始, 使用结束键停止:
+
+```toml
+[daemon]
+hotkey = "ctrl+f2"
+hotkey-mode = "trigger-end"
+end-hotkey = "ctrl+f3"
+```
+
+`trigger-end` 模式必须配置 `end-hotkey`. `end-hotkey` 的写法和 `hotkey` 相同, 并且不能和 `hotkey` 相同.
+
 ## 示例
 
 ```toml
@@ -50,6 +81,8 @@ model-revision = "asr-models"
 
 [daemon]
 hotkey = "ctrl+f2"
+hotkey-mode = "pressed"
+# end-hotkey = "ctrl+f3"
 save-dataset = false
 append-newline = false
 inject-method = "auto"

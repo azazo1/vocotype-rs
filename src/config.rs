@@ -19,6 +19,10 @@ model-revision = "asr-models"
 # 热键可以写单键或组合键. 组合键用 + 连接, 修饰键在前, 主键在后.
 # 示例: "F2", "ctrl+f2", "cmdorctrl+space", "shift+alt+KeyQ".
 hotkey = "F2"
+# 可选值: "pressed", "toggle", "trigger-end".
+hotkey-mode = "pressed"
+# trigger-end 模式下需要配置结束热键.
+# end-hotkey = "F3"
 save-dataset = false
 # dataset-dir = "/path/to/dataset"
 append-newline = false
@@ -62,12 +66,38 @@ pub fn config_schema() -> &'static str {
     "daemon": {
       "type": "object",
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "hotkey-mode": {
+                "const": "trigger-end"
+              }
+            },
+            "required": ["hotkey-mode"]
+          },
+          "then": {
+            "required": ["end-hotkey"]
+          }
+        }
+      ],
       "properties": {
         "hotkey": {
           "type": "string",
           "default": "F2",
           "description": "按住录音的全局热键. 支持单键或组合键. 组合键用 + 连接, 修饰键在前, 主键在后, 例如 F2, ctrl+f2, cmdorctrl+space, shift+alt+KeyQ.",
           "examples": ["F2", "ctrl+f2", "cmdorctrl+space", "shift+alt+KeyQ"]
+        },
+        "hotkey-mode": {
+          "type": "string",
+          "enum": ["pressed", "toggle", "trigger-end"],
+          "default": "pressed",
+          "description": "热键触发模式. pressed 表示按住 hotkey 录音并在松开时停止. toggle 表示按一次 hotkey 开始, 再按一次停止. trigger-end 表示按 hotkey 开始, 按 end-hotkey 停止."
+        },
+        "end-hotkey": {
+          "type": "string",
+          "description": "trigger-end 模式下用于停止录音的结束热键. 写法和 hotkey 相同.",
+          "examples": ["F3", "ctrl+f3", "cmdorctrl+space"]
         },
         "save-dataset": {
           "type": "boolean",
@@ -179,6 +209,10 @@ pub struct AppConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct DaemonConfig {
     pub hotkey: Option<String>,
+    #[serde(alias = "hotkey-mode")]
+    pub hotkey_mode: Option<String>,
+    #[serde(alias = "end-hotkey")]
+    pub end_hotkey: Option<String>,
     #[serde(alias = "save-dataset")]
     pub save_dataset: Option<bool>,
     #[serde(alias = "dataset-dir")]
@@ -282,6 +316,8 @@ model-revision = "test-revision"
 [daemon]
 idle-unload-secs = 42
 tail-padding-ms = 250
+hotkey-mode = "toggle"
+end-hotkey = "F3"
 
 [transcribe]
 subtitle-max-chars = 32
@@ -293,6 +329,8 @@ subtitle-max-chars = 32
         assert_eq!(config.model_revision.as_deref(), Some("test-revision"));
         assert_eq!(config.daemon.idle_unload_secs, Some(42));
         assert_eq!(config.daemon.tail_padding_ms, Some(250));
+        assert_eq!(config.daemon.hotkey_mode.as_deref(), Some("toggle"));
+        assert_eq!(config.daemon.end_hotkey.as_deref(), Some("F3"));
         assert_eq!(config.transcribe.subtitle_max_chars, Some(32));
     }
 

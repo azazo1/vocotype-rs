@@ -12,9 +12,37 @@ use crate::inject::InjectMethod;
 use crate::models::ModelStore;
 use crate::overlay::{OverlayMode, OverlayState, create as create_overlay};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HotkeyMode {
+    Pressed,
+    Toggle,
+    TriggerEnd,
+}
+
+impl HotkeyMode {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "pressed" | "press" | "hold" => Ok(Self::Pressed),
+            "toggle" => Ok(Self::Toggle),
+            "trigger-end" | "trigger_end" | "triggerend" => Ok(Self::TriggerEnd),
+            _ => anyhow::bail!("不支持的热键模式: {}", value),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pressed => "pressed",
+            Self::Toggle => "toggle",
+            Self::TriggerEnd => "trigger-end",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct DaemonOptions {
     pub hotkey: String,
+    pub hotkey_mode: HotkeyMode,
+    pub end_hotkey: Option<String>,
     pub save_dataset: bool,
     pub dataset_dir: Option<PathBuf>,
     pub append_newline: bool,
@@ -50,4 +78,25 @@ pub async fn run_daemon(store: ModelStore, options: DaemonOptions) -> Result<()>
     });
 
     overlay_runner.run().context("无法启动悬浮窗")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_hotkey_modes() {
+        assert_eq!(HotkeyMode::parse("pressed").unwrap(), HotkeyMode::Pressed);
+        assert_eq!(HotkeyMode::parse("hold").unwrap(), HotkeyMode::Pressed);
+        assert_eq!(HotkeyMode::parse("toggle").unwrap(), HotkeyMode::Toggle);
+        assert_eq!(
+            HotkeyMode::parse("trigger_end").unwrap(),
+            HotkeyMode::TriggerEnd
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_hotkey_mode() {
+        assert!(HotkeyMode::parse("single").is_err());
+    }
 }

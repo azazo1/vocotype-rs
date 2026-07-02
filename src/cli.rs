@@ -9,7 +9,7 @@ use clap_complete::{Shell, generate};
 use crate::asr::AsrEngine;
 use crate::audio::list_input_devices;
 use crate::config::{AppConfig, config_schema, default_config_path, default_config_template};
-use crate::daemon::{DaemonOptions, run_daemon};
+use crate::daemon::{DaemonOptions, HotkeyMode, run_daemon};
 use crate::inject::InjectMethod;
 use crate::models::{DEFAULT_REVISION, ModelOptions, ModelStore};
 use crate::subtitle::{SubtitleOptions, transcribe_srt};
@@ -89,6 +89,21 @@ pub struct DaemonArgs {
         long_help = "按住录音的全局热键. 支持单键或组合键. 组合键用 + 连接, 修饰键在前, 主键在后, 例如 F2, ctrl+f2, cmdorctrl+space."
     )]
     pub hotkey: String,
+
+    #[arg(
+        long,
+        default_value = "pressed",
+        help = "选择热键触发模式",
+        long_help = "选择热键触发模式. pressed 表示按住 hotkey 录音并在松开时停止. toggle 表示按一次 hotkey 开始, 再按一次停止. trigger-end 表示按 hotkey 开始, 按 end-hotkey 停止."
+    )]
+    pub hotkey_mode: String,
+
+    #[arg(
+        long,
+        help = "trigger-end 模式下用于停止录音的结束热键",
+        long_help = "trigger-end 模式下用于停止录音的结束热键. 写法和 hotkey 相同, 例如 F3, ctrl+f3, cmdorctrl+space."
+    )]
+    pub end_hotkey: Option<String>,
 
     #[arg(long, default_value_t = false, help = "保存转写音频和结果用于数据集")]
     pub save_dataset: bool,
@@ -244,6 +259,8 @@ pub async fn run() -> Result<()> {
         Command::Daemon(args) => {
             let daemon = DaemonOptions {
                 hotkey: args.hotkey,
+                hotkey_mode: HotkeyMode::parse(&args.hotkey_mode)?,
+                end_hotkey: args.end_hotkey,
                 save_dataset: args.save_dataset,
                 dataset_dir: args.dataset_dir,
                 append_newline: args.append_newline,
@@ -440,6 +457,8 @@ fn write_global_config_status(
 fn write_daemon_config_status(writer: &mut impl Write, config: &AppConfig) -> Result<()> {
     let daemon = &config.daemon;
     write_env_value_status(writer, "hotkey", daemon.hotkey.clone(), "VOCOTYPE_HOTKEY")?;
+    write_value_status_without_source(writer, "hotkey-mode", daemon.hotkey_mode.clone())?;
+    write_value_status_without_source(writer, "end-hotkey", daemon.end_hotkey.clone())?;
     write_value_status_without_source(writer, "save-dataset", daemon.save_dataset)?;
     write_env_value_status(
         writer,
@@ -563,6 +582,16 @@ fn apply_daemon_config(args: &mut DaemonArgs, matches: &ArgMatches, config: &App
         std::mem::take(&mut args.hotkey),
         matches.value_source("hotkey"),
         daemon.hotkey.clone(),
+    );
+    args.hotkey_mode = merge_value(
+        std::mem::take(&mut args.hotkey_mode),
+        matches.value_source("hotkey_mode"),
+        daemon.hotkey_mode.clone(),
+    );
+    args.end_hotkey = merge_option(
+        args.end_hotkey.take(),
+        matches.value_source("end_hotkey"),
+        daemon.end_hotkey.clone(),
     );
     args.save_dataset = merge_value(
         args.save_dataset,
@@ -722,6 +751,8 @@ mod config_tests {
         let config = AppConfig {
             daemon: DaemonConfig {
                 hotkey: Some("F3".to_string()),
+                hotkey_mode: Some("trigger-end".to_string()),
+                end_hotkey: Some("F4".to_string()),
                 append_newline: Some(true),
                 idle_unload_secs: Some(0),
                 ..Default::default()
@@ -735,6 +766,8 @@ mod config_tests {
             panic!("expected daemon command");
         };
         assert_eq!(args.hotkey, "F3");
+        assert_eq!(args.hotkey_mode, "trigger-end");
+        assert_eq!(args.end_hotkey.as_deref(), Some("F4"));
         assert!(args.append_newline);
         assert_eq!(args.idle_unload_secs, 0);
     }
