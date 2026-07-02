@@ -33,6 +33,8 @@ pub(super) fn transcription_worker(
                 success: false,
                 text: String::new(),
                 raw_text: String::new(),
+                tokens: Vec::new(),
+                token_timestamps: None,
                 duration: pcm.duration_seconds(),
                 inference_latency: 0.0,
                 confidence: 0.0,

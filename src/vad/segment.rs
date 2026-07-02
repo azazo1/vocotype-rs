@@ -10,6 +10,10 @@ pub struct SpeechSegment {
     pub samples: Vec<i16>,
     pub reason: SegmentReason,
     pub speech_ms: u32,
+    pub start_sample: usize,
+    pub end_sample: usize,
+    pub audio_start_sample: usize,
+    pub audio_end_sample: usize,
 }
 
 pub(super) fn expand_bounds(

@@ -124,6 +124,8 @@ impl VadSegmenter {
         let local_start = start - self.input_offset;
         let local_end = end - self.input_offset;
         let samples = self.input_samples[local_start..local_end].to_vec();
+        let segment_start = speech_start.max(start);
+        let segment_end = speech_end.min(end).max(segment_start);
         self.emitted_until = end;
         self.prune_buffer();
 
@@ -131,6 +133,10 @@ impl VadSegmenter {
             samples,
             reason,
             speech_ms: samples_to_ms(speech_len, self.config.sample_rate),
+            start_sample: segment_start,
+            end_sample: segment_end,
+            audio_start_sample: start,
+            audio_end_sample: end,
         })
     }
 

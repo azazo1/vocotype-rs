@@ -9,6 +9,7 @@ mod inject;
 mod logging;
 mod models;
 mod overlay;
+mod subtitle;
 mod vad;
 mod wav;
 

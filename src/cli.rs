@@ -1,13 +1,14 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::asr::AsrEngine;
 use crate::audio::list_input_devices;
 use crate::daemon::{DaemonOptions, run_daemon};
 use crate::inject::InjectMethod;
 use crate::models::{DEFAULT_REVISION, ModelOptions, ModelStore};
+use crate::subtitle::{SubtitleOptions, transcribe_srt};
 
 #[derive(Parser, Debug)]
 #[command(name = "vocotype", version, about = "VocoType Rust 版")]
@@ -71,8 +72,23 @@ pub struct TranscribeArgs {
     #[arg(long)]
     pub audio: PathBuf,
 
+    #[arg(long, value_enum, default_value_t = TranscribeFormat::Json)]
+    pub format: TranscribeFormat,
+
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+
     #[arg(long, default_value_t = false)]
     pub pretty: bool,
+
+    #[arg(long, default_value_t = 24)]
+    pub subtitle_max_chars: usize,
+}
+
+#[derive(Clone, Debug, ValueEnum)]
+pub enum TranscribeFormat {
+    Json,
+    Srt,
 }
 
 #[derive(Args, Debug)]
@@ -113,12 +129,31 @@ pub async fn run() -> Result<()> {
             run_daemon(store, daemon).await
         }
         Command::Transcribe(args) => {
-            let engine = AsrEngine::load(store)?;
-            let result = engine.transcribe_file(&args.audio)?;
-            if args.pretty {
-                println!("{}", serde_json::to_string_pretty(&result)?);
-            } else {
-                println!("{}", serde_json::to_string(&result)?);
+            match args.format {
+                TranscribeFormat::Json => {
+                    let engine = AsrEngine::load(store)?;
+                    let result = engine.transcribe_file(&args.audio)?;
+                    if args.pretty {
+                        println!("{}", serde_json::to_string_pretty(&result)?);
+                    } else {
+                        println!("{}", serde_json::to_string(&result)?);
+                    }
+                }
+                TranscribeFormat::Srt => {
+                    let srt = transcribe_srt(
+                        store,
+                        &args.audio,
+                        SubtitleOptions {
+                            max_chars: args.subtitle_max_chars,
+                        },
+                    )?;
+                    if let Some(output) = args.output {
+                        crate::app::ensure_parent(&output)?;
+                        std::fs::write(&output, srt)?;
+                    } else {
+                        print!("{}", srt);
+                    }
+                }
             }
             Ok(())
         }

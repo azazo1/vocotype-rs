@@ -21,6 +21,8 @@ pub struct TranscriptionResult {
     pub success: bool,
     pub text: String,
     pub raw_text: String,
+    pub tokens: Vec<String>,
+    pub token_timestamps: Option<Vec<f32>>,
     pub duration: f32,
     pub inference_latency: f32,
     pub confidence: f32,
@@ -86,6 +88,8 @@ impl AsrEngine {
             .get_result()
             .ok_or_else(|| anyhow!("ASR 解码没有返回结果"))?;
         let raw_text = result.text.trim().to_string();
+        let tokens = result.tokens;
+        let token_timestamps = result.timestamps;
         let latency = start.elapsed().as_secs_f32();
         let duration = audio.duration_seconds();
         let duration_label = format!("{:.2}", duration);
@@ -116,6 +120,8 @@ impl AsrEngine {
             success,
             text: text.clone(),
             raw_text,
+            tokens,
+            token_timestamps,
             duration,
             inference_latency: latency,
             confidence: if success { 1.0 } else { 0.0 },
