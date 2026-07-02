@@ -85,7 +85,8 @@ pub struct DaemonArgs {
         long,
         default_value = "F2",
         env = "VOCOTYPE_HOTKEY",
-        help = "按住录音的全局热键"
+        help = "按住录音的全局热键",
+        long_help = "按住录音的全局热键. 支持单键或组合键. 组合键用 + 连接, 修饰键在前, 主键在后, 例如 F2, ctrl+f2, cmdorctrl+space."
     )]
     pub hotkey: String,
 

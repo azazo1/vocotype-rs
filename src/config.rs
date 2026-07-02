@@ -16,6 +16,8 @@ pub fn default_config_template() -> &'static str {
 model-revision = "asr-models"
 
 [daemon]
+# 热键可以写单键或组合键. 组合键用 + 连接, 修饰键在前, 主键在后.
+# 示例: "F2", "ctrl+f2", "cmdorctrl+space", "shift+alt+KeyQ".
 hotkey = "F2"
 save-dataset = false
 # dataset-dir = "/path/to/dataset"
@@ -64,7 +66,8 @@ pub fn config_schema() -> &'static str {
         "hotkey": {
           "type": "string",
           "default": "F2",
-          "description": "按住录音的全局热键."
+          "description": "按住录音的全局热键. 支持单键或组合键. 组合键用 + 连接, 修饰键在前, 主键在后, 例如 F2, ctrl+f2, cmdorctrl+space, shift+alt+KeyQ.",
+          "examples": ["F2", "ctrl+f2", "cmdorctrl+space", "shift+alt+KeyQ"]
         },
         "save-dataset": {
           "type": "boolean",
