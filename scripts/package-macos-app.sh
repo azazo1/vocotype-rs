@@ -11,12 +11,19 @@ APP_DIR="$APP_ROOT/$APP_NAME.app"
 CONTENTS_DIR="$APP_DIR/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
+ICON_NAME="app-icon"
+ICON_FILE="$ICON_NAME.icns"
+ICON_SOURCE="assets/$ICON_FILE"
 
 cargo build --release --bin "$BIN_NAME"
 
 rm -rf "$APP_DIR"
 mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
 cp "$TARGET_DIR/release/$BIN_NAME" "$MACOS_DIR/$BIN_NAME"
+
+if [ -f "$ICON_SOURCE" ]; then
+    cp "$ICON_SOURCE" "$RESOURCES_DIR/$ICON_FILE"
+fi
 
 cat > "$CONTENTS_DIR/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -31,6 +38,8 @@ cat > "$CONTENTS_DIR/Info.plist" <<PLIST
     <string>$BIN_NAME</string>
     <key>CFBundleIdentifier</key>
     <string>$BUNDLE_ID</string>
+    <key>CFBundleIconFile</key>
+    <string>$ICON_NAME</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>

@@ -13,13 +13,17 @@ clippy:
 test:
     cargo test
 
+# 生成 macOS app icon 资产.
+build-icon:
+    sh scripts/build-macos-icon.sh
+
 # just run-daemon --hotkey F2
 # 启动 daemon.
 run-daemon *args:
     cargo run -- daemon {{args}}
 
 # 生成 macOS .app bundle, 输出到 target/macos-app/VocoType.app.
-package-macos:
+package-macos: build-icon
     sh scripts/package-macos-app.sh
 
 # just download-models --model-dir ./models
