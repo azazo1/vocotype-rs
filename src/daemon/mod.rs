@@ -46,6 +46,7 @@ pub struct DaemonOptions {
     pub save_dataset: bool,
     pub dataset_dir: Option<PathBuf>,
     pub append_newline: bool,
+    pub strip_trailing_period: bool,
     pub inject_method: InjectMethod,
     pub end_silence_ms: u32,
     pub pre_roll_ms: u32,

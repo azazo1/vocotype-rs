@@ -22,6 +22,7 @@ pub(super) struct TranscriptionWorkerConfig {
     pub state: SharedRuntimeState,
     pub inject_method: InjectMethod,
     pub append_newline: bool,
+    pub strip_trailing_period: bool,
     pub idle_unload_secs: u64,
 }
 
@@ -80,7 +81,12 @@ pub(super) fn transcription_worker(
             warn!(%error, "数据集记录失败");
         }
 
-        let transcript = result.success.then_some(result.text.as_str());
+        let output_text = if config.strip_trailing_period {
+            strip_trailing_period(&result.text)
+        } else {
+            result.text.clone()
+        };
+        let transcript = result.success.then_some(output_text.as_str());
         let (remaining, transcript_lines) = match finish_queue_item(&config.state, transcript) {
             Ok(result) => result,
             Err(error) => {
@@ -91,7 +97,7 @@ pub(super) fn transcription_worker(
 
         if result.success {
             if let Err(error) =
-                type_text(&result.text, config.append_newline, config.inject_method.clone())
+                type_text(&output_text, config.append_newline, config.inject_method.clone())
             {
                 config.overlay.set(overlay_state_with_lines(
                     OverlayMode::Error {
@@ -166,6 +172,23 @@ fn ensure_engine(
     Ok(loaded)
 }
 
+fn strip_trailing_period(text: &str) -> String {
+    let trimmed = text.trim_end();
+    let Some(last) = trimmed.chars().next_back() else {
+        return text.to_string();
+    };
+    if !is_period(last) {
+        return text.to_string();
+    }
+    trimmed[..trimmed.len() - last.len_utf8()]
+        .trim_end()
+        .to_string()
+}
+
+fn is_period(ch: char) -> bool {
+    matches!(ch, '.' | '\u{3002}' | '\u{ff0e}')
+}
+
 fn handle_worker_error(
     overlay: &OverlayHandle,
     state: &SharedRuntimeState,
@@ -203,5 +226,12 @@ mod tests {
         drop(tx);
         let event = recv_segment(&rx, None);
         assert!(matches!(event, WorkerEvent::Closed));
+    }
+
+    #[test]
+    fn strips_only_trailing_period() {
+        assert_eq!(strip_trailing_period("你好\u{3002}"), "你好");
+        assert_eq!(strip_trailing_period("hello.  "), "hello");
+        assert_eq!(strip_trailing_period("你好\u{ff01}"), "你好\u{ff01}");
     }
 }

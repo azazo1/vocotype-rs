@@ -26,6 +26,7 @@ hotkey-mode = "pressed"
 save-dataset = false
 # dataset-dir = "/path/to/dataset"
 append-newline = false
+strip-trailing-period = false
 inject-method = "auto"
 end-silence-ms = 650
 pre-roll-ms = 180
@@ -112,6 +113,11 @@ pub fn config_schema() -> &'static str {
           "type": "boolean",
           "default": false,
           "description": "注入文本后是否追加换行."
+        },
+        "strip-trailing-period": {
+          "type": "boolean",
+          "default": false,
+          "description": "注入文本前是否删除末尾的句号."
         },
         "inject-method": {
           "type": "string",
@@ -219,6 +225,8 @@ pub struct DaemonConfig {
     pub dataset_dir: Option<PathBuf>,
     #[serde(alias = "append-newline")]
     pub append_newline: Option<bool>,
+    #[serde(alias = "strip-trailing-period")]
+    pub strip_trailing_period: Option<bool>,
     #[serde(alias = "inject-method")]
     pub inject_method: Option<String>,
     #[serde(alias = "end-silence-ms")]
@@ -318,6 +326,7 @@ idle-unload-secs = 42
 tail-padding-ms = 250
 hotkey-mode = "toggle"
 end-hotkey = "F3"
+strip-trailing-period = true
 
 [transcribe]
 subtitle-max-chars = 32
@@ -331,6 +340,7 @@ subtitle-max-chars = 32
         assert_eq!(config.daemon.tail_padding_ms, Some(250));
         assert_eq!(config.daemon.hotkey_mode.as_deref(), Some("toggle"));
         assert_eq!(config.daemon.end_hotkey.as_deref(), Some("F3"));
+        assert_eq!(config.daemon.strip_trailing_period, Some(true));
         assert_eq!(config.transcribe.subtitle_max_chars, Some(32));
     }
 

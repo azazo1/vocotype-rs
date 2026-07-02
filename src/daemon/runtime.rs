@@ -54,6 +54,7 @@ pub(super) fn run_daemon_loop(
     let state_worker = state.clone();
     let inject_method = options.inject_method.clone();
     let append_newline = options.append_newline;
+    let strip_trailing_period = options.strip_trailing_period;
     let idle_unload_secs = options.idle_unload_secs;
     tokio::task::spawn_blocking(move || {
         transcription_worker(
@@ -64,6 +65,7 @@ pub(super) fn run_daemon_loop(
                 state: state_worker,
                 inject_method,
                 append_newline,
+                strip_trailing_period,
                 idle_unload_secs,
             },
             segment_rx,

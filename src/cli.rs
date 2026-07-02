@@ -119,6 +119,9 @@ pub struct DaemonArgs {
     #[arg(long, default_value_t = false, help = "注入文本后追加换行")]
     pub append_newline: bool,
 
+    #[arg(long, default_value_t = false, help = "注入文本前删除末尾句号")]
+    pub strip_trailing_period: bool,
+
     #[arg(
         long,
         env = "VOCOTYPE_INJECT_METHOD",
@@ -270,6 +273,7 @@ pub async fn run() -> Result<()> {
                 save_dataset: args.save_dataset,
                 dataset_dir: args.dataset_dir,
                 append_newline: args.append_newline,
+                strip_trailing_period: args.strip_trailing_period,
                 inject_method: InjectMethod::parse(&args.inject_method),
                 end_silence_ms: args.end_silence_ms,
                 pre_roll_ms: args.pre_roll_ms,
@@ -480,6 +484,11 @@ fn write_daemon_config_status(writer: &mut impl Write, config: &AppConfig) -> Re
         "VOCOTYPE_DATASET_DIR",
     )?;
     write_value_status_without_source(writer, "append-newline", daemon.append_newline)?;
+    write_value_status_without_source(
+        writer,
+        "strip-trailing-period",
+        daemon.strip_trailing_period,
+    )?;
     write_env_value_status(
         writer,
         "inject-method",
@@ -613,6 +622,11 @@ fn apply_daemon_config(args: &mut DaemonArgs, matches: &ArgMatches, config: &App
         args.append_newline,
         matches.value_source("append_newline"),
         daemon.append_newline,
+    );
+    args.strip_trailing_period = merge_value(
+        args.strip_trailing_period,
+        matches.value_source("strip_trailing_period"),
+        daemon.strip_trailing_period,
     );
     args.inject_method = merge_value(
         std::mem::take(&mut args.inject_method),
@@ -768,6 +782,7 @@ mod config_tests {
                 hotkey_mode: Some("trigger-end".to_string()),
                 end_hotkey: Some("F4".to_string()),
                 append_newline: Some(true),
+                strip_trailing_period: Some(true),
                 idle_unload_secs: Some(0),
                 ..Default::default()
             },
@@ -783,6 +798,7 @@ mod config_tests {
         assert_eq!(args.hotkey_mode, "trigger-end");
         assert_eq!(args.end_hotkey.as_deref(), Some("F4"));
         assert!(args.append_newline);
+        assert!(args.strip_trailing_period);
         assert_eq!(args.idle_unload_secs, 0);
     }
 
