@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::{Shell, generate};
 
 use crate::asr::AsrEngine;
 use crate::audio::list_input_devices;
@@ -11,15 +12,39 @@ use crate::models::{DEFAULT_REVISION, ModelOptions, ModelStore};
 use crate::subtitle::{SubtitleOptions, transcribe_srt};
 
 #[derive(Parser, Debug)]
-#[command(name = "vocotype", version, about = "VocoType Rust 版")]
+#[command(
+    name = "vocotype",
+    version,
+    about = "本地语音转写和文本注入工具",
+    long_about = "VocoType 使用本地 sherpa-onnx 模型完成录音转写, VAD 分段, 标点恢复, 文本注入和 SRT 字幕输出."
+)]
 pub struct Cli {
-    #[arg(long, env = "VOCOTYPE_MODEL_DIR", global = true)]
+    #[arg(
+        long,
+        env = "VOCOTYPE_MODEL_DIR",
+        global = true,
+        help = "指定模型加载目录",
+        long_help = "指定 ASR, VAD 和 PUNC 模型的加载根目录. 也可以通过 VOCOTYPE_MODEL_DIR 设置."
+    )]
     pub model_dir: Option<PathBuf>,
 
-    #[arg(long, env = "VOCOTYPE_MODEL_CACHE_DIR", global = true)]
+    #[arg(
+        long,
+        env = "VOCOTYPE_MODEL_CACHE_DIR",
+        global = true,
+        help = "指定模型下载缓存目录",
+        long_help = "指定 models download 写入下载缓存和模型文件的目录. 也可以通过 VOCOTYPE_MODEL_CACHE_DIR 设置."
+    )]
     pub model_cache_dir: Option<PathBuf>,
 
-    #[arg(long, env = "VOCOTYPE_MODEL_REVISION", default_value = DEFAULT_REVISION, global = true)]
+    #[arg(
+        long,
+        env = "VOCOTYPE_MODEL_REVISION",
+        default_value = DEFAULT_REVISION,
+        global = true,
+        help = "指定模型版本标签",
+        long_help = "指定模型 manifest 记录的 revision. 默认使用当前 sherpa-onnx release 标签."
+    )]
     pub model_revision: String,
 
     #[command(subcommand)]
@@ -28,67 +53,114 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    #[command(alias = "d", about = "启动热键监听和悬浮窗")]
     Daemon(DaemonArgs),
+    #[command(alias = "t", about = "转写音频文件或生成 SRT 字幕")]
     Transcribe(TranscribeArgs),
+    #[command(alias = "m", about = "下载和检查本地模型")]
     Models(ModelsCommand),
+    #[command(about = "列出可用麦克风输入设备")]
     Devices,
+    #[command(alias = "comp", about = "生成 shell 补全脚本")]
+    Completion(CompletionArgs),
 }
 
 #[derive(Args, Debug)]
 pub struct DaemonArgs {
-    #[arg(long, default_value = "F2", env = "VOCOTYPE_HOTKEY")]
+    #[arg(
+        long,
+        default_value = "F2",
+        env = "VOCOTYPE_HOTKEY",
+        help = "按住录音的全局热键"
+    )]
     pub hotkey: String,
 
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, help = "保存转写音频和结果用于数据集")]
     pub save_dataset: bool,
 
-    #[arg(long, env = "VOCOTYPE_DATASET_DIR")]
+    #[arg(
+        long,
+        env = "VOCOTYPE_DATASET_DIR",
+        help = "指定数据集保存目录"
+    )]
     pub dataset_dir: Option<PathBuf>,
 
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, help = "注入文本后追加换行")]
     pub append_newline: bool,
 
-    #[arg(long, env = "VOCOTYPE_INJECT_METHOD", default_value = "auto")]
+    #[arg(
+        long,
+        env = "VOCOTYPE_INJECT_METHOD",
+        default_value = "auto",
+        help = "选择文本注入方式",
+        long_help = "选择文本注入方式. 可用值由 inject 模块解析, 常用值包括 auto, enigo 和 clipboard."
+    )]
     pub inject_method: String,
 
-    #[arg(long, default_value_t = 650)]
+    #[arg(long, default_value_t = 650, help = "判定语音结束的静音毫秒数")]
     pub end_silence_ms: u32,
 
-    #[arg(long, default_value_t = 180)]
+    #[arg(long, default_value_t = 180, help = "分段前保留的音频毫秒数")]
     pub pre_roll_ms: u32,
 
-    #[arg(long, default_value_t = 180)]
+    #[arg(long, default_value_t = 180, help = "分段后追加的音频毫秒数")]
     pub tail_padding_ms: u32,
 
-    #[arg(long, default_value_t = 240)]
+    #[arg(long, default_value_t = 240, help = "保留语音段的最短毫秒数")]
     pub min_speech_ms: u32,
 
-    #[arg(long, default_value_t = 15_000)]
+    #[arg(long, default_value_t = 15_000, help = "单个语音段的最长毫秒数")]
     pub max_segment_ms: u32,
 }
 
 #[derive(Args, Debug)]
 pub struct TranscribeArgs {
-    #[arg(long)]
+    #[arg(index = 1, help = "要转写的 WAV 音频文件")]
     pub audio: PathBuf,
 
-    #[arg(long, value_enum, default_value_t = TranscribeFormat::Json)]
+    #[arg(
+        short,
+        long,
+        value_enum,
+        default_value_t = TranscribeFormat::Json,
+        help = "选择输出格式"
+    )]
     pub format: TranscribeFormat,
 
-    #[arg(long)]
+    #[arg(long, default_value_t = false, conflicts_with = "json", help = "等效于 --format srt")]
+    pub srt: bool,
+
+    #[arg(long, default_value_t = false, help = "等效于 --format json")]
+    pub json: bool,
+
+    #[arg(short, long, help = "把转写结果写入文件")]
     pub output: Option<PathBuf>,
 
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, help = "以 pretty JSON 输出转写结果")]
     pub pretty: bool,
 
-    #[arg(long, default_value_t = 24)]
+    #[arg(long, default_value_t = 24, help = "SRT 每条字幕的目标最大字符数")]
     pub subtitle_max_chars: usize,
 }
 
 #[derive(Clone, Debug, ValueEnum)]
 pub enum TranscribeFormat {
+    #[value(help = "输出 JSON 转写结果")]
     Json,
+    #[value(help = "输出 SRT 字幕")]
     Srt,
+}
+
+impl TranscribeArgs {
+    fn resolved_format(&self) -> TranscribeFormat {
+        if self.srt {
+            TranscribeFormat::Srt
+        } else if self.json {
+            TranscribeFormat::Json
+        } else {
+            self.format.clone()
+        }
+    }
 }
 
 #[derive(Args, Debug)]
@@ -99,8 +171,16 @@ pub struct ModelsCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum ModelsSubcommand {
+    #[command(about = "下载 ASR, VAD 和 PUNC 模型")]
     Download,
+    #[command(about = "检查模型目录和运行时加载能力")]
     Doctor,
+}
+
+#[derive(Args, Debug)]
+pub struct CompletionArgs {
+    #[arg(value_enum, help = "要生成补全脚本的 shell")]
+    pub shell: Shell,
 }
 
 pub async fn run() -> Result<()> {
@@ -129,7 +209,7 @@ pub async fn run() -> Result<()> {
             run_daemon(store, daemon).await
         }
         Command::Transcribe(args) => {
-            match args.format {
+            match args.resolved_format() {
                 TranscribeFormat::Json => {
                     let engine = AsrEngine::load(store)?;
                     let result = engine.transcribe_file(&args.audio)?;
@@ -173,6 +253,11 @@ pub async fn run() -> Result<()> {
             for device in list_input_devices()? {
                 println!("{}", device);
             }
+            Ok(())
+        }
+        Command::Completion(args) => {
+            let mut command = Cli::command();
+            generate(args.shell, &mut command, "vocotype", &mut std::io::stdout());
             Ok(())
         }
     }

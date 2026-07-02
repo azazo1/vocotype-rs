@@ -13,6 +13,7 @@ arboard = "3"
 bzip2 = "0.6"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 clap = { version = "4.6", features = ["derive", "env"] }
+clap_complete = "4.6"
 cpal = "0.18"
 crossbeam-channel = "0.5"
 directories = "6"
