@@ -10,6 +10,7 @@ use sherpa_onnx::{
 };
 use tracing::{debug, info, warn};
 
+use crate::dict::{DEFAULT_HOTWORDS_SCORE, SpeechDictionary};
 use crate::models::{AsrModelFiles, ModelStore, PuncModelFiles};
 use crate::wav::PcmAudio;
 
@@ -40,18 +41,41 @@ impl TranscriptionResult {
 pub struct AsrEngine {
     recognizer: OfflineRecognizer,
     punctuator: OfflinePunctuation,
+    dictionary: SpeechDictionary,
+    hotwords_text: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct AsrOptions {
+    pub dictionary: SpeechDictionary,
+    pub hotwords_score: f32,
+}
+
+impl Default for AsrOptions {
+    fn default() -> Self {
+        Self {
+            dictionary: SpeechDictionary::builtin(),
+            hotwords_score: DEFAULT_HOTWORDS_SCORE,
+        }
+    }
 }
 
 impl AsrEngine {
     pub fn load(store: ModelStore) -> Result<Arc<Self>> {
+        Self::load_with_options(store, AsrOptions::default())
+    }
+
+    pub fn load_with_options(store: ModelStore, options: AsrOptions) -> Result<Arc<Self>> {
         store.verify_required()?;
         let asr_files = store.asr_model_files()?;
         let punc_files = store.punc_model_files()?;
-        let recognizer = create_recognizer(&asr_files)?;
+        let hotwords_text = options.dictionary.hotwords_text();
+        let recognizer = create_recognizer(&asr_files, options.hotwords_score)?;
         let punctuator = create_punctuator(&punc_files)?;
         info!(
             model = %asr_files.model.display(),
             tokens = %asr_files.tokens.display(),
+            hotwords = options.dictionary.hotword_count(),
             "ASR 模型加载完成"
         );
         info!(
@@ -61,6 +85,8 @@ impl AsrEngine {
         Ok(Arc::new(Self {
             recognizer,
             punctuator,
+            dictionary: options.dictionary,
+            hotwords_text,
         }))
     }
 
@@ -81,7 +107,12 @@ impl AsrEngine {
             crate::wav::resample_linear_i16(&audio.samples, audio.sample_rate, TARGET_SAMPLE_RATE)
         };
         let samples = i16_to_f32(&samples_i16);
-        let stream = self.recognizer.create_stream();
+        let stream = if self.hotwords_text.is_empty() {
+            self.recognizer.create_stream()
+        } else {
+            self.recognizer
+                .create_stream_with_hotwords(&self.hotwords_text)
+        };
         stream.accept_waveform(TARGET_SAMPLE_RATE as i32, &samples);
         self.recognizer.decode(&stream);
         let result = stream
@@ -96,7 +127,8 @@ impl AsrEngine {
         let latency_label = format!("{:.2}", latency);
         let success = !raw_text.is_empty();
         let text = if success {
-            self.restore_punctuation(&raw_text)
+            let punctuated = self.restore_punctuation(&raw_text);
+            self.dictionary.rewrite_text(&punctuated)
         } else {
             raw_text.clone()
         };
@@ -144,7 +176,7 @@ impl AsrEngine {
     }
 }
 
-fn create_recognizer(files: &AsrModelFiles) -> Result<OfflineRecognizer> {
+fn create_recognizer(files: &AsrModelFiles, hotwords_score: f32) -> Result<OfflineRecognizer> {
     let mut config = OfflineRecognizerConfig::default();
     config.model_config.paraformer = OfflineParaformerModelConfig {
         model: Some(path_string(&files.model)?),
@@ -152,6 +184,7 @@ fn create_recognizer(files: &AsrModelFiles) -> Result<OfflineRecognizer> {
     config.model_config.tokens = Some(path_string(&files.tokens)?);
     config.model_config.num_threads = 2;
     config.model_config.provider = Some("cpu".to_string());
+    config.hotwords_score = hotwords_score;
 
     OfflineRecognizer::create(&config).with_context(|| {
         format!(

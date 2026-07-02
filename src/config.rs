@@ -13,7 +13,11 @@ pub fn default_config_template() -> &'static str {
 
 # model-dir = "/path/to/models"
 # model-cache-dir = "/path/to/model-cache"
+# dict-path = "~/.config/vocotype/dict.toml"
 model-revision = "asr-models"
+
+[asr]
+hotwords-score = 3.0
 
 [daemon]
 # 热键可以写单键或组合键. 组合键用 + 连接, 修饰键在前, 主键在后.
@@ -63,6 +67,22 @@ pub fn config_schema() -> &'static str {
       "type": "string",
       "default": "asr-models",
       "description": "模型 manifest 记录的 revision."
+    },
+    "dict-path": {
+      "type": "string",
+      "description": "用户词汇表 dict.toml 路径."
+    },
+    "asr": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "hotwords-score": {
+          "type": "number",
+          "minimum": 0,
+          "default": 3.0,
+          "description": "sherpa-onnx hotwords 加权分数."
+        }
+      }
     },
     "daemon": {
       "type": "object",
@@ -207,8 +227,18 @@ pub struct AppConfig {
     pub model_cache_dir: Option<PathBuf>,
     #[serde(alias = "model-revision")]
     pub model_revision: Option<String>,
+    #[serde(alias = "dict-path")]
+    pub dict_path: Option<PathBuf>,
+    pub asr: AsrConfig,
     pub daemon: DaemonConfig,
     pub transcribe: TranscribeConfig,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AsrConfig {
+    #[serde(alias = "hotwords-score")]
+    pub hotwords_score: Option<f32>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -320,6 +350,10 @@ mod tests {
             r#"
 model-dir = "/tmp/vocotype-models"
 model-revision = "test-revision"
+dict-path = "/tmp/vocotype-dict.toml"
+
+[asr]
+hotwords-score = 4.5
 
 [daemon]
 idle-unload-secs = 42
@@ -336,6 +370,11 @@ subtitle-max-chars = 32
 
         assert_eq!(config.model_dir, Some(PathBuf::from("/tmp/vocotype-models")));
         assert_eq!(config.model_revision.as_deref(), Some("test-revision"));
+        assert_eq!(
+            config.dict_path,
+            Some(PathBuf::from("/tmp/vocotype-dict.toml"))
+        );
+        assert_eq!(config.asr.hotwords_score, Some(4.5));
         assert_eq!(config.daemon.idle_unload_secs, Some(42));
         assert_eq!(config.daemon.tail_padding_ms, Some(250));
         assert_eq!(config.daemon.hotkey_mode.as_deref(), Some("toggle"));
@@ -349,6 +388,10 @@ subtitle-max-chars = 32
         let config = AppConfig::from_toml(
             r#"
 model_dir = "/tmp/vocotype-models"
+dict_path = "/tmp/vocotype-dict.toml"
+
+[asr]
+hotwords_score = 2.5
 
 [daemon]
 save_dataset = true
@@ -358,6 +401,11 @@ dataset_dir = "/tmp/dataset"
         .unwrap();
 
         assert_eq!(config.model_dir, Some(PathBuf::from("/tmp/vocotype-models")));
+        assert_eq!(
+            config.dict_path,
+            Some(PathBuf::from("/tmp/vocotype-dict.toml"))
+        );
+        assert_eq!(config.asr.hotwords_score, Some(2.5));
         assert_eq!(config.daemon.save_dataset, Some(true));
         assert_eq!(config.daemon.dataset_dir, Some(PathBuf::from("/tmp/dataset")));
     }

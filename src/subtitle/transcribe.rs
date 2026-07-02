@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::Result;
 use tracing::{debug, info};
 
-use crate::asr::{AsrEngine, TARGET_SAMPLE_RATE};
+use crate::asr::{AsrEngine, AsrOptions, TARGET_SAMPLE_RATE};
 use crate::models::ModelStore;
 use crate::vad::{SpeechSegment, VadConfig, VadSegmenter};
 
@@ -15,12 +15,14 @@ use super::text::{
 #[derive(Clone, Debug)]
 pub struct SubtitleOptions {
     pub max_chars: usize,
+    pub asr_options: AsrOptions,
 }
 
 impl Default for SubtitleOptions {
     fn default() -> Self {
         Self {
             max_chars: default_max_chars(),
+            asr_options: AsrOptions::default(),
         }
     }
 }
@@ -33,7 +35,7 @@ pub fn transcribe_srt(
     store.verify_required()?;
     store.verify_vad_checksum()?;
     let pcm = crate::wav::read_wav_mono_i16(audio, TARGET_SAMPLE_RATE)?;
-    let engine = AsrEngine::load(store.clone())?;
+    let engine = AsrEngine::load_with_options(store.clone(), options.asr_options.clone())?;
     let mut segmenter = VadSegmenter::new(VadConfig::default(), &store.vad_model_path()?)?;
     let segments = segment_audio(&mut segmenter, &pcm.samples);
 

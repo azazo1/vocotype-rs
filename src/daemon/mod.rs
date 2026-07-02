@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use tracing::error;
 
+use crate::asr::AsrOptions;
 use crate::hotkey::{HotkeyConfig, HotkeyManager};
 use crate::inject::InjectMethod;
 use crate::models::ModelStore;
@@ -55,6 +56,7 @@ pub struct DaemonOptions {
     pub min_speech_ms: u32,
     pub max_segment_ms: u32,
     pub idle_unload_secs: u64,
+    pub asr_options: AsrOptions,
 }
 
 pub async fn run_daemon(store: ModelStore, options: DaemonOptions) -> Result<()> {

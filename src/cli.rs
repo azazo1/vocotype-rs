@@ -6,10 +6,13 @@ use clap::parser::ValueSource;
 use clap::{ArgMatches, Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 
-use crate::asr::AsrEngine;
+use crate::asr::{AsrEngine, AsrOptions};
 use crate::audio::list_input_devices;
 use crate::config::{AppConfig, config_schema, default_config_path, default_config_template};
 use crate::daemon::{DaemonOptions, HotkeyMode, run_daemon};
+use crate::dict::{
+    DEFAULT_HOTWORDS_SCORE, SpeechDictionary, default_dict_template, write_dict_doctor,
+};
 use crate::inject::InjectMethod;
 use crate::models::{DEFAULT_REVISION, ModelOptions, ModelStore};
 use crate::subtitle::{SubtitleOptions, transcribe_srt};
@@ -59,6 +62,25 @@ pub struct Cli {
     )]
     pub config: Option<PathBuf>,
 
+    #[arg(
+        long = "dict",
+        env = "VOCOTYPE_DICT",
+        global = true,
+        help = "指定用户词汇表路径",
+        long_help = "指定 dict.toml 词汇表路径. 默认读取 ~/.config/vocotype/dict.toml, 文件不存在时使用内置词汇表."
+    )]
+    pub dict: Option<PathBuf>,
+
+    #[arg(
+        long,
+        env = "VOCOTYPE_HOTWORDS_SCORE",
+        default_value_t = DEFAULT_HOTWORDS_SCORE,
+        global = true,
+        help = "指定 hotwords 加权分数",
+        long_help = "指定 sherpa-onnx hotwords 加权分数. 分数越高, 词汇表中的词越容易被识别出来."
+    )]
+    pub hotwords_score: f32,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -80,6 +102,8 @@ pub enum Command {
     Devices,
     #[command(alias = "cfg", about = "生成和检查配置文件")]
     Config(ConfigCommand),
+    #[command(about = "生成和检查用户词汇表")]
+    Dict(DictCommand),
     #[command(alias = "comp", about = "生成 shell 补全脚本")]
     Completion(CompletionArgs),
 }
@@ -241,6 +265,20 @@ pub enum ConfigSubcommand {
 }
 
 #[derive(Args, Debug)]
+pub struct DictCommand {
+    #[command(subcommand)]
+    pub command: DictSubcommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DictSubcommand {
+    #[command(about = "输出默认词汇表模板")]
+    Default,
+    #[command(about = "检查词汇表是否加载并生效")]
+    Doctor,
+}
+
+#[derive(Args, Debug)]
 pub struct CompletionArgs {
     #[arg(value_enum, help = "要生成补全脚本的 shell")]
     pub shell: Shell,
@@ -250,12 +288,35 @@ pub async fn run() -> Result<()> {
     let matches = Cli::command().get_matches();
     let mut cli = Cli::from_arg_matches(&matches)?;
     let config_path = cli.config.clone();
-    if let Command::Config(args) = cli.command {
+    if matches!(&cli.command, Command::Config(_)) {
+        let Command::Config(args) = cli.command else {
+            unreachable!();
+        };
         return run_config_command(args, config_path.as_deref(), &matches);
+    }
+    if matches!(
+        &cli.command,
+        Command::Dict(DictCommand {
+            command: DictSubcommand::Default,
+        })
+    ) {
+        return run_dict_command(
+            DictCommand {
+                command: DictSubcommand::Default,
+            },
+            None,
+        );
     }
 
     let config = AppConfig::load(cli.config.as_deref())?;
     apply_config(&mut cli, &matches, &config)?;
+    if matches!(&cli.command, Command::Dict(_)) {
+        let dict_path = cli.dict.clone();
+        let Command::Dict(args) = cli.command else {
+            unreachable!();
+        };
+        return run_dict_command(args, dict_path.as_deref());
+    }
 
     let options = ModelOptions {
         model_dir: cli.model_dir.clone(),
@@ -263,6 +324,10 @@ pub async fn run() -> Result<()> {
         revision: cli.model_revision.clone(),
     };
     let store = ModelStore::new(&options);
+    let asr_options = AsrOptions {
+        dictionary: SpeechDictionary::load(cli.dict.as_deref())?,
+        hotwords_score: cli.hotwords_score,
+    };
 
     match cli.command {
         Command::Daemon(args) => {
@@ -281,13 +346,14 @@ pub async fn run() -> Result<()> {
                 min_speech_ms: args.min_speech_ms,
                 max_segment_ms: args.max_segment_ms,
                 idle_unload_secs: args.idle_unload_secs,
+                asr_options,
             };
             run_daemon(store, daemon).await
         }
         Command::Transcribe(args) => {
             match args.resolved_format() {
                 TranscribeFormat::Json => {
-                    let engine = AsrEngine::load(store)?;
+                    let engine = AsrEngine::load_with_options(store, asr_options)?;
                     let result = engine.transcribe_file(&args.audio)?;
                     if args.pretty {
                         println!("{}", serde_json::to_string_pretty(&result)?);
@@ -301,6 +367,7 @@ pub async fn run() -> Result<()> {
                         &args.audio,
                         SubtitleOptions {
                             max_chars: args.subtitle_max_chars,
+                            asr_options,
                         },
                     )?;
                     if let Some(output) = args.output {
@@ -332,6 +399,7 @@ pub async fn run() -> Result<()> {
             Ok(())
         }
         Command::Config(_) => unreachable!("config command is handled before config loading"),
+        Command::Dict(_) => unreachable!("dict command is handled before model loading"),
         Command::Completion(args) => {
             let mut command = Cli::command();
             generate(args.shell, &mut command, "vocotype", &mut std::io::stdout());
@@ -356,12 +424,26 @@ fn apply_config(cli: &mut Cli, matches: &ArgMatches, config: &AppConfig) -> Resu
         matches.value_source("model_revision"),
         config.model_revision.clone(),
     );
+    cli.dict = merge_option(
+        cli.dict.take(),
+        matches.value_source("dict"),
+        config.dict_path.clone(),
+    );
+    cli.hotwords_score = merge_value(
+        cli.hotwords_score,
+        matches.value_source("hotwords_score"),
+        config.asr.hotwords_score,
+    );
 
     if let Some((_, sub_matches)) = matches.subcommand() {
         match &mut cli.command {
             Command::Daemon(args) => apply_daemon_config(args, sub_matches, config),
             Command::Transcribe(args) => apply_transcribe_config(args, sub_matches, config)?,
-            Command::Models(_) | Command::Devices | Command::Config(_) | Command::Completion(_) => {
+            Command::Models(_)
+            | Command::Devices
+            | Command::Config(_)
+            | Command::Dict(_)
+            | Command::Completion(_) => {
             }
         }
     }
@@ -384,6 +466,16 @@ fn run_config_command(
             Ok(())
         }
         ConfigSubcommand::Doctor => write_config_doctor(config_path, matches, io::stdout()),
+    }
+}
+
+fn run_dict_command(args: DictCommand, dict_path: Option<&Path>) -> Result<()> {
+    match args.command {
+        DictSubcommand::Default => {
+            print!("{}", default_dict_template());
+            Ok(())
+        }
+        DictSubcommand::Doctor => write_dict_doctor(dict_path, io::stdout()),
     }
 }
 
@@ -422,6 +514,9 @@ fn write_config_doctor(
     writeln!(writer)?;
     writeln!(writer, "全局配置")?;
     write_global_config_status(&mut writer, matches, &loaded.config)?;
+    writeln!(writer)?;
+    writeln!(writer, "asr 配置")?;
+    write_asr_config_status(&mut writer, matches, &loaded.config)?;
     writeln!(writer)?;
     writeln!(writer, "daemon 配置")?;
     write_daemon_config_status(&mut writer, &loaded.config)?;
@@ -464,6 +559,29 @@ fn write_global_config_status(
         "model-revision",
         config.model_revision.clone(),
         matches.value_source("model_revision"),
+    )?;
+    write_value_status(
+        writer,
+        "dict-path",
+        config
+            .dict_path
+            .as_ref()
+            .map(|value| value.display().to_string()),
+        matches.value_source("dict"),
+    )?;
+    Ok(())
+}
+
+fn write_asr_config_status(
+    writer: &mut impl Write,
+    matches: &ArgMatches,
+    config: &AppConfig,
+) -> Result<()> {
+    write_value_status(
+        writer,
+        "hotwords-score",
+        config.asr.hotwords_score,
+        matches.value_source("hotwords_score"),
     )?;
     Ok(())
 }

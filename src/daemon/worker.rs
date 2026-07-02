@@ -4,7 +4,7 @@ use std::time::Duration;
 use crossbeam_channel::Receiver;
 use tracing::{debug, error, info, warn};
 
-use crate::asr::{AsrEngine, TARGET_SAMPLE_RATE, TranscriptionResult};
+use crate::asr::{AsrEngine, AsrOptions, TARGET_SAMPLE_RATE, TranscriptionResult};
 use crate::dataset::DatasetRecorder;
 use crate::inject::{InjectMethod, type_text};
 use crate::models::ModelStore;
@@ -24,6 +24,7 @@ pub(super) struct TranscriptionWorkerConfig {
     pub append_newline: bool,
     pub strip_trailing_period: bool,
     pub idle_unload_secs: u64,
+    pub asr_options: AsrOptions,
 }
 
 pub(super) fn transcription_worker(
@@ -45,7 +46,7 @@ pub(super) fn transcription_worker(
             }
             WorkerEvent::Closed => break,
         };
-        let engine = match ensure_engine(&mut engine, &config.store) {
+        let engine = match ensure_engine(&mut engine, &config.store, config.asr_options.clone()) {
             Ok(engine) => engine,
             Err(error) => {
                 handle_worker_error(
@@ -162,12 +163,13 @@ fn recv_segment(
 fn ensure_engine(
     engine: &mut Option<Arc<AsrEngine>>,
     store: &ModelStore,
+    asr_options: AsrOptions,
 ) -> anyhow::Result<Arc<AsrEngine>> {
     if let Some(engine) = engine {
         return Ok(engine.clone());
     }
     debug!("懒加载 ASR 和 PUNC 模型");
-    let loaded = AsrEngine::load(store.clone())?;
+    let loaded = AsrEngine::load_with_options(store.clone(), asr_options)?;
     *engine = Some(loaded.clone());
     Ok(loaded)
 }

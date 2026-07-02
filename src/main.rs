@@ -5,6 +5,7 @@ mod cli;
 mod config;
 mod daemon;
 mod dataset;
+mod dict;
 mod hotkey;
 mod inject;
 mod logging;
