@@ -65,7 +65,12 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    #[command(alias = "d", about = "启动热键监听和悬浮窗")]
+    #[command(
+        alias = "d",
+        alias = "listen",
+        alias = "l",
+        about = "启动热键监听和悬浮窗"
+    )]
     Daemon(DaemonArgs),
     #[command(alias = "t", about = "转写音频文件或生成 SRT 字幕")]
     Transcribe(TranscribeArgs),
@@ -108,11 +113,7 @@ pub struct DaemonArgs {
     #[arg(long, default_value_t = false, help = "保存转写音频和结果用于数据集")]
     pub save_dataset: bool,
 
-    #[arg(
-        long,
-        env = "VOCOTYPE_DATASET_DIR",
-        help = "指定数据集保存目录"
-    )]
+    #[arg(long, env = "VOCOTYPE_DATASET_DIR", help = "指定数据集保存目录")]
     pub dataset_dir: Option<PathBuf>,
 
     #[arg(long, default_value_t = false, help = "注入文本后追加换行")]
@@ -165,7 +166,12 @@ pub struct TranscribeArgs {
     )]
     pub format: TranscribeFormat,
 
-    #[arg(long, default_value_t = false, conflicts_with = "json", help = "等效于 --format srt")]
+    #[arg(
+        long,
+        default_value_t = false,
+        conflicts_with = "json",
+        help = "等效于 --format srt"
+    )]
     pub srt: bool,
 
     #[arg(long, default_value_t = false, help = "等效于 --format json")]
@@ -351,7 +357,8 @@ fn apply_config(cli: &mut Cli, matches: &ArgMatches, config: &AppConfig) -> Resu
         match &mut cli.command {
             Command::Daemon(args) => apply_daemon_config(args, sub_matches, config),
             Command::Transcribe(args) => apply_transcribe_config(args, sub_matches, config)?,
-            Command::Models(_) | Command::Devices | Command::Config(_) | Command::Completion(_) => {}
+            Command::Models(_) | Command::Devices | Command::Config(_) | Command::Completion(_) => {
+            }
         }
     }
 
@@ -433,7 +440,10 @@ fn write_global_config_status(
     write_value_status(
         writer,
         "model-dir",
-        config.model_dir.as_ref().map(|value| value.display().to_string()),
+        config
+            .model_dir
+            .as_ref()
+            .map(|value| value.display().to_string()),
         matches.value_source("model_dir"),
     )?;
     write_value_status(
@@ -489,11 +499,7 @@ fn write_transcribe_config_status(writer: &mut impl Write, config: &AppConfig) -
     let transcribe = &config.transcribe;
     write_value_status_without_source(writer, "format", transcribe.format.clone())?;
     write_value_status_without_source(writer, "pretty", transcribe.pretty)?;
-    write_value_status_without_source(
-        writer,
-        "subtitle-max-chars",
-        transcribe.subtitle_max_chars,
-    )?;
+    write_value_status_without_source(writer, "subtitle-max-chars", transcribe.subtitle_max_chars)?;
     Ok(())
 }
 
@@ -661,7 +667,11 @@ fn apply_transcribe_config(
         matches.value_source("format"),
         configured_format,
     );
-    args.pretty = merge_value(args.pretty, matches.value_source("pretty"), transcribe.pretty);
+    args.pretty = merge_value(
+        args.pretty,
+        matches.value_source("pretty"),
+        transcribe.pretty,
+    );
     args.subtitle_max_chars = merge_value(
         args.subtitle_max_chars,
         matches.value_source("subtitle_max_chars"),
@@ -683,7 +693,11 @@ fn merge_value<T>(value: T, source: Option<ValueSource>, configured: Option<T>) 
     }
 }
 
-fn merge_option<T>(value: Option<T>, source: Option<ValueSource>, configured: Option<T>) -> Option<T> {
+fn merge_option<T>(
+    value: Option<T>,
+    source: Option<ValueSource>,
+    configured: Option<T>,
+) -> Option<T> {
     if should_use_config(source) {
         configured.or(value)
     } else {
@@ -775,12 +789,7 @@ mod config_tests {
     #[test]
     fn command_line_global_values_override_config_after_subcommand() {
         let matches = Cli::command()
-            .try_get_matches_from([
-                "vocotype",
-                "daemon",
-                "--model-dir",
-                "/tmp/cli-models",
-            ])
+            .try_get_matches_from(["vocotype", "daemon", "--model-dir", "/tmp/cli-models"])
             .unwrap();
         let mut cli = Cli::from_arg_matches(&matches).unwrap();
         let config = AppConfig {
