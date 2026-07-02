@@ -1,53 +1,11 @@
 use std::path::Path;
-use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use sherpa_onnx::{SileroVadModelConfig, VadModelConfig, VoiceActivityDetector};
 
-#[derive(Clone, Debug)]
-pub struct VadConfig {
-    pub sample_rate: u32,
-    pub threshold: f32,
-    pub pre_roll_ms: u32,
-    pub tail_padding_ms: u32,
-    pub end_silence_ms: u32,
-    pub min_speech_ms: u32,
-    pub max_segment_ms: u32,
-}
-
-impl Default for VadConfig {
-    fn default() -> Self {
-        Self {
-            sample_rate: 16_000,
-            threshold: 0.5,
-            pre_roll_ms: 180,
-            tail_padding_ms: 180,
-            end_silence_ms: 650,
-            min_speech_ms: 240,
-            max_segment_ms: 15_000,
-        }
-    }
-}
-
-impl VadConfig {
-    fn samples_for_ms(&self, ms: u32) -> usize {
-        (self.sample_rate as usize * ms as usize) / 1_000
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum SegmentReason {
-    EndSilence,
-    MaxDuration,
-    Finish,
-}
-
-#[derive(Clone, Debug)]
-pub struct SpeechSegment {
-    pub samples: Vec<i16>,
-    pub reason: SegmentReason,
-    pub speech_ms: u32,
-}
+use super::audio::{i16_to_f32, path_string, samples_to_ms};
+use super::config::VadConfig;
+use super::segment::{SegmentReason, SpeechSegment, expand_bounds};
 
 pub struct VadSegmenter {
     config: VadConfig,
@@ -186,61 +144,5 @@ impl VadSegmenter {
         let drain_len = (keep_from - self.input_offset).min(self.input_samples.len());
         self.input_samples.drain(..drain_len);
         self.input_offset += drain_len;
-    }
-}
-
-fn path_string(path: &Path) -> Result<String> {
-    path.to_str()
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| anyhow!("路径不是有效 UTF-8: {}", path.display()))
-}
-
-fn i16_to_f32(samples: &[i16]) -> Vec<f32> {
-    samples
-        .iter()
-        .map(|sample| *sample as f32 / i16::MAX as f32)
-        .collect()
-}
-
-fn expand_bounds(
-    speech_start: usize,
-    speech_end: usize,
-    pre_roll_samples: usize,
-    tail_padding_samples: usize,
-    available_end: usize,
-) -> (usize, usize) {
-    let start = speech_start.saturating_sub(pre_roll_samples);
-    let end = speech_end
-        .saturating_add(tail_padding_samples)
-        .min(available_end);
-    (start, end)
-}
-
-fn samples_to_ms(samples: usize, sample_rate: u32) -> u32 {
-    if sample_rate == 0 {
-        return 0;
-    }
-    Duration::from_secs_f64(samples as f64 / sample_rate as f64).as_millis() as u32
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn expands_with_pre_roll_and_tail_padding() {
-        let (start, end) = expand_bounds(1_000, 3_000, 200, 300, 4_000);
-        assert_eq!((start, end), (800, 3_300));
-    }
-
-    #[test]
-    fn expansion_stays_inside_available_audio() {
-        let (start, end) = expand_bounds(100, 3_000, 500, 2_000, 3_200);
-        assert_eq!((start, end), (0, 3_200));
-    }
-
-    #[test]
-    fn samples_to_ms_uses_sample_rate() {
-        assert_eq!(samples_to_ms(8_000, 16_000), 500);
     }
 }
