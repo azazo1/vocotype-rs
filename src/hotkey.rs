@@ -32,8 +32,13 @@ impl HotkeyConfig {
 
 pub struct HotkeyManager {
     _manager: GlobalHotKeyManager,
-    _hotkey: HotKey,
-    _end_hotkey: Option<HotKey>,
+    matcher: HotkeyMatcher,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct HotkeyMatcher {
+    hotkey: HotKey,
+    end_hotkey: Option<HotKey>,
 }
 
 impl HotkeyManager {
@@ -45,34 +50,44 @@ impl HotkeyManager {
             return Err(anyhow!("结束热键不能和触发热键相同"));
         }
         manager.register(hotkey)?;
+        let matcher = HotkeyMatcher {
+            hotkey,
+            end_hotkey,
+        };
         if let Some(end_hotkey) = end_hotkey {
             manager.register(end_hotkey)?;
             info!(
-                hotkey = %hotkey.into_string(),
+                hotkey = %matcher.trigger_label(),
                 end_hotkey = %end_hotkey.into_string(),
                 "已注册全局热键"
             );
             return Ok(Self {
                 _manager: manager,
-                _hotkey: hotkey,
-                _end_hotkey: Some(end_hotkey),
+                matcher,
             });
         }
 
-        info!(hotkey = %hotkey.into_string(), "已注册全局热键");
+        info!(hotkey = %matcher.trigger_label(), "已注册全局热键");
         Ok(Self {
             _manager: manager,
-            _hotkey: hotkey,
-            _end_hotkey: None,
+            matcher,
         })
     }
 
+    pub fn matcher(&self) -> HotkeyMatcher {
+        self.matcher
+    }
+
+    pub fn events() -> &'static global_hotkey::GlobalHotKeyEventReceiver {
+        GlobalHotKeyEvent::receiver()
+    }
+}
+
+impl HotkeyMatcher {
     pub fn action(&self, event: global_hotkey::GlobalHotKeyEvent) -> Option<HotkeyEvent> {
-        let role = if event.id() == self._hotkey.id() {
+        let role = if event.id() == self.hotkey.id() {
             HotkeyRole::Trigger
-        } else if self
-            ._end_hotkey
-            .is_some_and(|hotkey| event.id() == hotkey.id())
+        } else if self.end_hotkey.is_some_and(|hotkey| event.id() == hotkey.id())
         {
             HotkeyRole::End
         } else {
@@ -85,15 +100,11 @@ impl HotkeyManager {
     }
 
     pub fn trigger_label(&self) -> String {
-        self._hotkey.into_string()
+        self.hotkey.into_string()
     }
 
     pub fn end_label(&self) -> Option<String> {
-        self._end_hotkey.map(HotKey::into_string)
-    }
-
-    pub fn events() -> &'static global_hotkey::GlobalHotKeyEventReceiver {
-        GlobalHotKeyEvent::receiver()
+        self.end_hotkey.map(HotKey::into_string)
     }
 }
 

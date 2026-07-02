@@ -1,12 +1,12 @@
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender};
 use tracing::{debug, info, warn};
 
 use crate::audio::AudioInput;
 use crate::dataset::DatasetRecorder;
-use crate::hotkey::{HotkeyAction, HotkeyConfig, HotkeyEvent, HotkeyManager, HotkeyRole};
+use crate::hotkey::{HotkeyAction, HotkeyEvent, HotkeyManager, HotkeyMatcher, HotkeyRole};
 use crate::models::ModelStore;
 use crate::overlay::{OverlayHandle, OverlayMode};
 use crate::vad::{SpeechSegment, VadSegmenter};
@@ -25,6 +25,7 @@ pub(super) fn run_daemon_loop(
     store: ModelStore,
     options: DaemonOptions,
     overlay: OverlayHandle,
+    hotkeys: HotkeyMatcher,
 ) -> Result<()> {
     let mut segmenter = build_segmenter(&options, &store)?;
     let dataset = if options.save_dataset {
@@ -37,16 +38,6 @@ pub(super) fn run_daemon_loop(
         None
     };
 
-    let hotkey_cfg = HotkeyConfig {
-        key: options.hotkey.clone(),
-        end_key: matches!(options.hotkey_mode, HotkeyMode::TriggerEnd)
-            .then(|| options.end_hotkey.clone())
-            .flatten(),
-    };
-    if matches!(options.hotkey_mode, HotkeyMode::TriggerEnd) && hotkey_cfg.end_key.is_none() {
-        bail!("trigger-end 热键模式需要配置 end-hotkey");
-    }
-    let hotkeys = HotkeyManager::new(&hotkey_cfg)?;
     let state = new_state();
 
     let (segment_tx, segment_rx) = crossbeam_channel::unbounded();

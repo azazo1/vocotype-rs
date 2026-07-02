@@ -5,9 +5,10 @@ mod worker;
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use tracing::error;
 
+use crate::hotkey::{HotkeyConfig, HotkeyManager};
 use crate::inject::InjectMethod;
 use crate::models::ModelStore;
 use crate::overlay::{OverlayMode, OverlayState, create as create_overlay};
@@ -66,9 +67,20 @@ pub async fn run_daemon(store: ModelStore, options: DaemonOptions) -> Result<()>
 
     let (overlay, overlay_runner) = create_overlay();
     overlay.idle();
+    let hotkey_cfg = HotkeyConfig {
+        key: options.hotkey.clone(),
+        end_key: matches!(options.hotkey_mode, HotkeyMode::TriggerEnd)
+            .then(|| options.end_hotkey.clone())
+            .flatten(),
+    };
+    if matches!(options.hotkey_mode, HotkeyMode::TriggerEnd) && hotkey_cfg.end_key.is_none() {
+        bail!("trigger-end 热键模式需要配置 end-hotkey");
+    }
+    let hotkey_manager = HotkeyManager::new(&hotkey_cfg)?;
+    let hotkeys = hotkey_manager.matcher();
     let daemon_overlay = overlay.clone();
     tokio::task::spawn_blocking(move || {
-        if let Err(error) = runtime::run_daemon_loop(store, options, daemon_overlay) {
+        if let Err(error) = runtime::run_daemon_loop(store, options, daemon_overlay, hotkeys) {
             error!(%error, "daemon 运行失败");
             overlay.set(OverlayState::new(
                 OverlayMode::Error {
