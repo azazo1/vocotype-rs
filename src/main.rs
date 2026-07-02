@@ -2,6 +2,7 @@ mod app;
 mod asr;
 mod audio;
 mod cli;
+mod config;
 mod daemon;
 mod dataset;
 mod hotkey;
