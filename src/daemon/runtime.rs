@@ -4,7 +4,6 @@ use anyhow::{Context, Result};
 use crossbeam_channel::Receiver;
 use tracing::{debug, info, warn};
 
-use crate::asr::AsrEngine;
 use crate::audio::AudioInput;
 use crate::dataset::DatasetRecorder;
 use crate::hotkey::{HotkeyAction, HotkeyConfig, HotkeyManager, recv_action};
@@ -18,14 +17,13 @@ use super::segments::{
 use super::state::{
     begin_recording_session, end_recording_session, new_state, overlay_state, pending_count,
 };
-use super::worker::transcription_worker;
+use super::worker::{TranscriptionWorkerConfig, transcription_worker};
 
 pub(super) fn run_daemon_loop(
     store: ModelStore,
     options: DaemonOptions,
     overlay: OverlayHandle,
 ) -> Result<()> {
-    let engine = AsrEngine::load(store.clone())?;
     let mut segmenter = build_segmenter(&options, &store)?;
     let dataset = if options.save_dataset {
         let dir = options
@@ -48,15 +46,19 @@ pub(super) fn run_daemon_loop(
     let state_worker = state.clone();
     let inject_method = options.inject_method.clone();
     let append_newline = options.append_newline;
+    let idle_unload_secs = options.idle_unload_secs;
     tokio::task::spawn_blocking(move || {
         transcription_worker(
-            engine,
-            dataset,
-            overlay_worker,
-            state_worker,
+            TranscriptionWorkerConfig {
+                store,
+                dataset,
+                overlay: overlay_worker,
+                state: state_worker,
+                inject_method,
+                append_newline,
+                idle_unload_secs,
+            },
             segment_rx,
-            inject_method,
-            append_newline,
         );
     });
 

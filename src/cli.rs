@@ -111,6 +111,14 @@ pub struct DaemonArgs {
 
     #[arg(long, default_value_t = 15_000, help = "单个语音段的最长毫秒数")]
     pub max_segment_ms: u32,
+
+    #[arg(
+        long,
+        default_value_t = 300,
+        help = "空闲多少秒后卸载 ASR 和 PUNC 模型",
+        long_help = "daemon 队列空闲达到该秒数后卸载 ASR 和 PUNC 模型以降低内存占用. 设置为 0 表示不自动卸载."
+    )]
+    pub idle_unload_secs: u64,
 }
 
 #[derive(Args, Debug)]
@@ -205,6 +213,7 @@ pub async fn run() -> Result<()> {
                 tail_padding_ms: args.tail_padding_ms,
                 min_speech_ms: args.min_speech_ms,
                 max_segment_ms: args.max_segment_ms,
+                idle_unload_secs: args.idle_unload_secs,
             };
             run_daemon(store, daemon).await
         }

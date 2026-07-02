@@ -24,6 +24,7 @@ pub struct DaemonOptions {
     pub tail_padding_ms: u32,
     pub min_speech_ms: u32,
     pub max_segment_ms: u32,
+    pub idle_unload_secs: u64,
 }
 
 pub async fn run_daemon(store: ModelStore, options: DaemonOptions) -> Result<()> {
