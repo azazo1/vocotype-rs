@@ -2,6 +2,8 @@
 
 VocoType 是一个本地语音转写和文本注入工具. 它使用本地 sherpa-onnx 模型完成语音识别, VAD 分段, 标点恢复, 热键录音, 文本注入和 SRT 字幕输出.
 
+本项目是 [vocotype-cli](https://github.com/233stone/vocotype-cli) 的 Rust 实现版本.
+
 ## 特性
 
 - 本地运行, 语音数据不需要发送到云端.
