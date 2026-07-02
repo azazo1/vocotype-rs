@@ -77,7 +77,7 @@ pub struct Cli {
         default_value_t = DEFAULT_HOTWORDS_SCORE,
         global = true,
         help = "指定 hotwords 加权分数",
-        long_help = "指定 sherpa-onnx hotwords 加权分数. 分数越高, 词汇表中的词越容易被识别出来."
+        long_help = "指定 sherpa-onnx hotwords 加权分数. 仅支持 contextual biasing 的模型会使用该分数, 当前默认 Paraformer 模型使用词表后处理."
     )]
     pub hotwords_score: f32,
 

@@ -25,6 +25,8 @@ dict-path = "~/.config/vocotype/dict.toml"
 hotwords-score = 3.0
 ```
 
+`hotwords-score` 只对支持 sherpa contextual biasing 的模型有效. 当前默认 Paraformer 模型会使用词表后处理, 不调用 sherpa hotwords stream.
+
 可以用下面的命令输出 `dict.toml` 模板:
 
 ```shell
@@ -37,7 +39,7 @@ vocotype dict default
 vocotype dict doctor
 ```
 
-`dict.toml` 支持 `hotwords`, `rewrites` 和 `rime-imports`. `hotwords` 会作为 sherpa-onnx hotwords 传入识别器, `rewrites` 会在标点恢复后做文本改写. 例如逐个字母读出 `g p t` 时, 可以改写为 `GPT`.
+`dict.toml` 支持 `hotwords`, `rewrites` 和 `rime-imports`. `hotwords` 用于后处理归一化英文热词, `rewrites` 会在标点恢复后做显式文本改写. 例如逐个字母读出 `g p t` 时, 可以改写为 `GPT`.
 
 ```toml
 hotwords = [
@@ -49,7 +51,6 @@ hotwords = [
 
 rime-imports = ["~/Library/Rime/wanxiang_english.dict.yaml"]
 max-rime-words = 20000
-rime-import-lowercase = false
 
 [rewrites]
 "g p t" = "GPT"
@@ -64,7 +65,7 @@ Rime `.dict.yaml` 路径示例:
 - Linux ibus: `~/.config/ibus/rime/wanxiang_english.dict.yaml`
 - Windows: `C:/Users/Alice/AppData/Roaming/Rime/wanxiang_english.dict.yaml`
 
-默认只导入 ASCII 英文词条, 并且只导入包含大写字母的词条. 如果需要导入小写英文词条, 设置 `rime-import-lowercase = true`.
+默认只导入 ASCII 英文词条.
 
 ## 热键
 

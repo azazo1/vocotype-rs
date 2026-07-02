@@ -85,9 +85,11 @@ vocotype transcribe input.wav --format srt --output input.srt
 
 词表支持三类内容:
 
-- `hotwords`: 提高 GPT, ChatGPT, API 这类词的识别优先级.
+- `hotwords`: 用于后处理归一化英文热词, 例如把 `gpt`, `g p t`, `open ai` 改成 `GPT`, `OpenAI`.
 - `rewrites`: 把逐字母转写结果改成目标写法, 例如 `g p t` 到 `GPT`.
 - `rime-imports`: 从 Rime 英文 `.dict.yaml` 导入 hotwords.
+
+当前默认 Paraformer ASR 模型不支持 sherpa contextual biasing, 所以 hotwords 不会直接改变 decoder 搜索结果. 如果需要处理更自由的误识别, 用 `[rewrites]` 写显式替换规则.
 
 示例:
 

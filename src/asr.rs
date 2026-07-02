@@ -42,7 +42,6 @@ pub struct AsrEngine {
     recognizer: OfflineRecognizer,
     punctuator: OfflinePunctuation,
     dictionary: SpeechDictionary,
-    hotwords_text: String,
 }
 
 #[derive(Clone, Debug)]
@@ -69,15 +68,18 @@ impl AsrEngine {
         store.verify_required()?;
         let asr_files = store.asr_model_files()?;
         let punc_files = store.punc_model_files()?;
-        let hotwords_text = options.dictionary.hotwords_text();
         let recognizer = create_recognizer(&asr_files, options.hotwords_score)?;
         let punctuator = create_punctuator(&punc_files)?;
         info!(
             model = %asr_files.model.display(),
             tokens = %asr_files.tokens.display(),
             hotwords = options.dictionary.hotword_count(),
+            hotword_rewrites = options.dictionary.hotword_rewrite_count(),
             "ASR 模型加载完成"
         );
+        if options.dictionary.hotword_count() > 0 {
+            info!("ASR 模型不支持 sherpa contextual biasing, 使用词表后处理");
+        }
         info!(
             model = %punc_files.model.display(),
             "PUNC 模型加载完成"
@@ -86,7 +88,6 @@ impl AsrEngine {
             recognizer,
             punctuator,
             dictionary: options.dictionary,
-            hotwords_text,
         }))
     }
 
@@ -107,12 +108,7 @@ impl AsrEngine {
             crate::wav::resample_linear_i16(&audio.samples, audio.sample_rate, TARGET_SAMPLE_RATE)
         };
         let samples = i16_to_f32(&samples_i16);
-        let stream = if self.hotwords_text.is_empty() {
-            self.recognizer.create_stream()
-        } else {
-            self.recognizer
-                .create_stream_with_hotwords(&self.hotwords_text)
-        };
+        let stream = self.recognizer.create_stream();
         stream.accept_waveform(TARGET_SAMPLE_RATE as i32, &samples);
         self.recognizer.decode(&stream);
         let result = stream

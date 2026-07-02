@@ -35,6 +35,7 @@ const BUILTIN_REWRITES: &[(&str, &str)] = &[
 #[derive(Clone, Debug)]
 pub struct SpeechDictionary {
     hotwords: Vec<String>,
+    hotword_rewrites: Vec<HotwordRewrite>,
     rewrites: Vec<RewriteRule>,
 }
 
@@ -50,6 +51,25 @@ pub struct LoadedDictionary {
 struct RewriteRule {
     from: String,
     to: String,
+}
+
+#[derive(Clone, Debug)]
+struct HotwordRewrite {
+    from: String,
+    to: String,
+}
+
+impl HotwordRewrite {
+    fn new(word: &str) -> Option<Self> {
+        let from = compact_hotword(word);
+        if from.len() < 2 || !should_normalize_hotword(word) {
+            return None;
+        }
+        Some(Self {
+            from,
+            to: word.to_string(),
+        })
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -168,19 +188,27 @@ impl SpeechDictionary {
             })
             .collect::<Vec<_>>();
         rewrite_rules.sort_by_key(|rule| std::cmp::Reverse(rule.from.len()));
+        let mut seen_hotword_rewrites = HashSet::new();
+        let mut hotword_rewrites = merged_hotwords
+            .iter()
+            .filter_map(|word| HotwordRewrite::new(word))
+            .filter(|rule| seen_hotword_rewrites.insert(rule.from.clone()))
+            .collect::<Vec<_>>();
+        hotword_rewrites.sort_by_key(|rule| std::cmp::Reverse(rule.from.len()));
 
         Self {
             hotwords: merged_hotwords,
+            hotword_rewrites,
             rewrites: rewrite_rules,
         }
     }
 
-    pub fn hotwords_text(&self) -> String {
-        self.hotwords.join("\n")
-    }
-
     pub fn hotword_count(&self) -> usize {
         self.hotwords.len()
+    }
+
+    pub fn hotword_rewrite_count(&self) -> usize {
+        self.hotword_rewrites.len()
     }
 
     pub fn rewrite_count(&self) -> usize {
@@ -191,6 +219,9 @@ impl SpeechDictionary {
         let mut output = text.to_string();
         for rule in &self.rewrites {
             output = replace_ascii_case_insensitive(&output, &rule.from, &rule.to);
+        }
+        for rule in &self.hotword_rewrites {
+            output = replace_compact_ascii_case_insensitive(&output, &rule.from, &rule.to);
         }
         output
     }
@@ -219,6 +250,9 @@ hotwords = [
   "API",
   "URL",
 ]
+
+# 当前默认 Paraformer 模型不支持 sherpa contextual biasing.
+# hotwords 用于后处理大小写和拆字母归一化.
 
 # 仅导入英文 Rime 词条.
 # Rime .dict.yaml 路径示例:
@@ -377,6 +411,20 @@ fn is_rime_english_word(word: &str) -> bool {
     is_valid_hotword(word)
 }
 
+fn should_normalize_hotword(word: &str) -> bool {
+    word.chars().any(|ch| ch.is_ascii_uppercase())
+        || word
+            .chars()
+            .any(|ch| matches!(ch, ' ' | '+' | '#' | '.' | '-' | '_' | '/'))
+}
+
+fn compact_hotword(word: &str) -> String {
+    word.chars()
+        .filter(|ch| !ch.is_ascii_whitespace())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect()
+}
+
 fn replace_ascii_case_insensitive(text: &str, from: &str, to: &str) -> String {
     if from.is_empty() {
         return text.to_string();
@@ -408,6 +456,68 @@ fn is_rewrite_boundary(text: &str, start: usize, end: usize) -> bool {
         && !after.is_some_and(|ch| ch.is_ascii_alphanumeric())
 }
 
+fn replace_compact_ascii_case_insensitive(text: &str, from: &str, to: &str) -> String {
+    if from.is_empty() {
+        return text.to_string();
+    }
+    let mut output = String::new();
+    let mut cursor = 0_usize;
+    while let Some((start, end)) = find_compact_ascii_match(text, cursor, from) {
+        output.push_str(&text[cursor..start]);
+        output.push_str(to);
+        cursor = end;
+    }
+    if cursor == 0 {
+        text.to_string()
+    } else {
+        output.push_str(&text[cursor..]);
+        output
+    }
+}
+
+fn find_compact_ascii_match(text: &str, cursor: usize, from: &str) -> Option<(usize, usize)> {
+    let first = from.chars().next()?;
+    for (relative, ch) in text[cursor..].char_indices() {
+        if !ch.is_ascii() || ch.is_ascii_whitespace() {
+            continue;
+        }
+        let start = cursor + relative;
+        if ch.to_ascii_lowercase() != first {
+            continue;
+        }
+        if let Some(end) = compact_ascii_match_end(text, start, from)
+            && is_rewrite_boundary(text, start, end)
+        {
+            return Some((start, end));
+        }
+    }
+    None
+}
+
+fn compact_ascii_match_end(text: &str, start: usize, from: &str) -> Option<usize> {
+    let mut expected = from.chars();
+    let mut current = expected.next()?;
+    let mut matched = false;
+    for (relative, ch) in text[start..].char_indices() {
+        if ch.is_ascii_whitespace() {
+            if matched {
+                continue;
+            }
+            return None;
+        }
+        if !ch.is_ascii() || ch.to_ascii_lowercase() != current {
+            return None;
+        }
+        matched = true;
+        let end = start + relative + ch.len_utf8();
+        match expected.next() {
+            Some(next) => current = next,
+            None => return Some(end),
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -431,6 +541,31 @@ mod tests {
         .unwrap();
         let (dict, _) = SpeechDictionary::from_config(&config, Path::new("/tmp/dict.toml")).unwrap();
         assert_eq!(dict.rewrite_text("g p t"), "ChatGPT");
+    }
+
+    #[test]
+    fn hotwords_are_normalized_after_rewrites() {
+        let dict = SpeechDictionary::builtin();
+        assert_eq!(dict.rewrite_text("g p t"), "GPT");
+        assert_eq!(dict.rewrite_text("G P T"), "GPT");
+        assert_eq!(dict.rewrite_text("we use gpt"), "we use GPT");
+        assert_eq!(dict.rewrite_text("chat g p t"), "ChatGPT");
+        assert_eq!(dict.rewrite_text("open ai"), "OpenAI");
+        assert_eq!(dict.rewrite_text("xxgpt"), "xxgpt");
+    }
+
+    #[test]
+    fn duplicate_compact_hotwords_keep_first_surface() {
+        let config = SpeechDictionary::config_from_toml(
+            r#"
+hotwords = [
+  "g p t",
+]
+"#,
+        )
+        .unwrap();
+        let (dict, _) = SpeechDictionary::from_config(&config, Path::new("/tmp/dict.toml")).unwrap();
+        assert_eq!(dict.rewrite_text("gpt"), "GPT");
     }
 
     #[test]
