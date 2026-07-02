@@ -1,6 +1,13 @@
-use tracing::warn;
+use objc2::rc::Retained;
+use tracing::{info, warn};
 
 use super::ScreenRect;
+
+pub(crate) struct StatusItem {
+    _status_bar: Retained<objc2_app_kit::NSStatusBar>,
+    _item: Retained<objc2_app_kit::NSStatusItem>,
+    _menu: Retained<objc2_app_kit::NSMenu>,
+}
 
 pub(crate) fn configure_native_options(native_options: &mut eframe::NativeOptions) {
     native_options.event_loop_builder = Some(Box::new(|builder| {
@@ -8,6 +15,13 @@ pub(crate) fn configure_native_options(native_options: &mut eframe::NativeOption
 
         builder.with_activation_policy(ActivationPolicy::Accessory);
     }));
+}
+
+pub(crate) fn install_status_item() -> Option<StatusItem> {
+    let mtm = objc2::MainThreadMarker::new()?;
+    let status_item = StatusItem::new(mtm);
+    info!("macOS 状态栏图标已创建");
+    Some(status_item)
 }
 
 pub(crate) fn configure_window(cc: &eframe::CreationContext<'_>) {
@@ -74,4 +88,67 @@ fn configure_window_inner(cc: &eframe::CreationContext<'_>) -> Result<(), String
 
     ns_window.setCollectionBehavior(behavior);
     Ok(())
+}
+
+impl StatusItem {
+    fn new(mtm: objc2::MainThreadMarker) -> Self {
+        use objc2::runtime::AnyObject;
+        use objc2::sel;
+        use objc2_app_kit::{
+            NSApplication, NSApplicationActivationPolicy, NSMenu, NSMenuItem,
+            NSStatusBar, NSVariableStatusItemLength,
+        };
+        use objc2_foundation::NSString;
+
+        let app = NSApplication::sharedApplication(mtm);
+        let _ = app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+
+        let status_bar = NSStatusBar::systemStatusBar();
+        let item = status_bar.statusItemWithLength(NSVariableStatusItemLength);
+        let title = NSString::from_str("V");
+        let tooltip = NSString::from_str("VocoType");
+        if let Some(button) = item.button(mtm) {
+            button.setTitle(&title);
+            button.setToolTip(Some(&tooltip));
+        }
+
+        let menu_title = NSString::from_str("VocoType");
+        let menu = NSMenu::initWithTitle(mtm.alloc(), &menu_title);
+        let running_title = NSString::from_str("VocoType 正在后台运行");
+        let empty_key = NSString::from_str("");
+        let running_item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                mtm.alloc(),
+                &running_title,
+                None,
+                &empty_key,
+            )
+        };
+        running_item.setEnabled(false);
+        menu.addItem(&running_item);
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
+
+        let quit_title = NSString::from_str("退出 VocoType");
+        let quit_item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                mtm.alloc(),
+                &quit_title,
+                Some(sel!(terminate:)),
+                &empty_key,
+            )
+        };
+        let app_object: &AnyObject = app.as_ref();
+        unsafe {
+            quit_item.setTarget(Some(app_object));
+        }
+        menu.addItem(&quit_item);
+
+        item.setMenu(Some(&menu));
+
+        Self {
+            _status_bar: status_bar,
+            _item: item,
+            _menu: menu,
+        }
+    }
 }

@@ -285,7 +285,11 @@ pub struct CompletionArgs {
 }
 
 pub async fn run() -> Result<()> {
-    let matches = Cli::command().get_matches();
+    let matches = if should_run_app_daemon() {
+        Cli::command().get_matches_from(["vocotype", "daemon"])
+    } else {
+        Cli::command().get_matches()
+    };
     let mut cli = Cli::from_arg_matches(&matches)?;
     let config_path = cli.config.clone();
     if matches!(&cli.command, Command::Config(_)) {
@@ -406,6 +410,32 @@ pub async fn run() -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn should_run_app_daemon() -> bool {
+    std::env::args_os().len() == 1 && launched_from_macos_app_bundle()
+}
+
+#[cfg(target_os = "macos")]
+fn launched_from_macos_app_bundle() -> bool {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .is_some_and(|parent| {
+            parent.file_name().is_some_and(|name| name == "MacOS")
+                && parent
+                    .parent()
+                    .is_some_and(|contents| contents.file_name().is_some_and(|name| name == "Contents"))
+                && parent
+                    .parent()
+                    .and_then(Path::parent)
+                    .is_some_and(|bundle| bundle.extension().is_some_and(|ext| ext == "app"))
+        })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn launched_from_macos_app_bundle() -> bool {
+    false
 }
 
 fn apply_config(cli: &mut Cli, matches: &ArgMatches, config: &AppConfig) -> Result<()> {

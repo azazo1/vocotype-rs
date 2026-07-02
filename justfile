@@ -18,6 +18,10 @@ test:
 run-daemon *args:
     cargo run -- daemon {{args}}
 
+# 生成 macOS .app bundle, 输出到 target/macos-app/VocoType.app.
+package-macos:
+    sh scripts/package-macos-app.sh
+
 # just download-models --model-dir ./models
 # 下载模型.
 download-models *args:

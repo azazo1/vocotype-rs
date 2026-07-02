@@ -21,6 +21,7 @@ pub(crate) struct OverlayApp {
     state: Arc<Mutex<OverlayState>>,
     receiver: Receiver<OverlayState>,
     visible: bool,
+    _status_item: Option<platform::StatusItem>,
     initial_hide_sent: bool,
     hide_at: Option<Instant>,
     mouse_passthrough: bool,
@@ -29,11 +30,16 @@ pub(crate) struct OverlayApp {
 }
 
 impl OverlayApp {
-    pub(crate) fn new(state: Arc<Mutex<OverlayState>>, receiver: Receiver<OverlayState>) -> Self {
+    pub(crate) fn new(
+        state: Arc<Mutex<OverlayState>>,
+        receiver: Receiver<OverlayState>,
+        status_item: Option<platform::StatusItem>,
+    ) -> Self {
         Self {
             state,
             receiver,
             visible: false,
+            _status_item: status_item,
             initial_hide_sent: false,
             hide_at: None,
             mouse_passthrough: true,

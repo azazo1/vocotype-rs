@@ -13,7 +13,8 @@ pub(crate) struct ScreenRect {
 
 #[cfg(target_os = "macos")]
 pub(crate) use macos::{
-    configure_native_options, configure_window, current_mouse_screen_rect,
+    StatusItem, configure_native_options, configure_window, current_mouse_screen_rect,
+    install_status_item,
 };
 #[cfg(target_os = "linux")]
 pub(crate) use linux::current_mouse_screen_rect;
@@ -25,6 +26,14 @@ pub(crate) fn configure_native_options(_native_options: &mut eframe::NativeOptio
 
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn configure_window(_cc: &eframe::CreationContext<'_>) {}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) struct StatusItem;
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn install_status_item() -> Option<StatusItem> {
+    None
+}
 
 #[cfg(not(any(
     target_os = "linux",

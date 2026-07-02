@@ -61,7 +61,8 @@ impl OverlayRunner {
             Box::new(move |cc| {
                 fonts::install(&cc.egui_ctx);
                 platform::configure_window(cc);
-                Ok(Box::new(OverlayApp::new(app_state, receiver)))
+                let status_item = platform::install_status_item();
+                Ok(Box::new(OverlayApp::new(app_state, receiver, status_item)))
             }),
         )
         .map_err(|error| {
