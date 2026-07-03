@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use tracing::{debug, info, warn};
 
 use crate::audio::AudioInput;
@@ -98,17 +98,22 @@ pub(super) fn run_daemon_loop(
                 if capture.capturing && let Some(rx) = &capture.audio_rx {
                     match rx.recv_timeout(Duration::from_millis(10)) {
                         Ok(frame) => {
-                            capture.last_frame_at = Instant::now();
-                            let level = frame_level(&frame);
-                            let mode = if segmenter.detected() {
-                                OverlayMode::Recording { level }
-                            } else {
-                                OverlayMode::Silence { pending: pending_count(&state) }
-                            };
-                            overlay.set(overlay_state(&state, mode));
-                            for segment in segmenter.push(&frame) {
-                                submit_segment(&segment_tx, &state, &overlay, segment)?;
-                            }
+                            process_audio_frame(
+                                frame,
+                                &mut segmenter,
+                                &segment_tx,
+                                &state,
+                                &overlay,
+                                &mut capture.last_frame_at,
+                            )?;
+                            drain_queued_audio_frames(
+                                rx,
+                                &mut segmenter,
+                                &segment_tx,
+                                &state,
+                                &overlay,
+                                &mut capture.last_frame_at,
+                            )?;
                         }
                         Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                             if capture.last_frame_at.elapsed() > Duration::from_millis(options.end_silence_ms as u64) {
@@ -129,6 +134,52 @@ pub(super) fn run_daemon_loop(
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+fn process_audio_frame(
+    frame: Vec<i16>,
+    segmenter: &mut VadSegmenter,
+    segment_tx: &Sender<SpeechSegment>,
+    state: &SharedRuntimeState,
+    overlay: &OverlayHandle,
+    last_frame_at: &mut Instant,
+) -> Result<()> {
+    *last_frame_at = Instant::now();
+    let level = frame_level(&frame);
+    let mode = if segmenter.detected() {
+        OverlayMode::Recording { level }
+    } else {
+        OverlayMode::Silence {
+            pending: pending_count(state),
+        }
+    };
+    overlay.set(overlay_state(state, mode));
+    for segment in segmenter.push(&frame) {
+        submit_segment(segment_tx, state, overlay, segment)?;
+    }
+    Ok(())
+}
+
+fn drain_queued_audio_frames(
+    audio_rx: &Receiver<Vec<i16>>,
+    segmenter: &mut VadSegmenter,
+    segment_tx: &Sender<SpeechSegment>,
+    state: &SharedRuntimeState,
+    overlay: &OverlayHandle,
+    last_frame_at: &mut Instant,
+) -> Result<()> {
+    loop {
+        match audio_rx.try_recv() {
+            Ok(frame) => {
+                process_audio_frame(frame, segmenter, segment_tx, state, overlay, last_frame_at)?
+            }
+            Err(TryRecvError::Empty) => return Ok(()),
+            Err(TryRecvError::Disconnected) => {
+                warn!("音频流断开");
+                return Ok(());
             }
         }
     }

@@ -1,7 +1,12 @@
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
+
 use anyhow::{Context, Result, anyhow, bail};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream};
-use crossbeam_channel::{Receiver, bounded};
+use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use tracing::{info, warn};
 
 use crate::asr::TARGET_SAMPLE_RATE;
@@ -24,11 +29,13 @@ impl AudioInput {
         let input_sample_rate = config.sample_rate;
         let channels = config.channels as usize;
         let (sender, receiver) = bounded::<Vec<i16>>(256);
+        let dropped_frames = Arc::new(AtomicU64::new(0));
 
         let err_fn = |error| warn!(%error, "音频输入流错误");
         let stream = match sample_format {
             SampleFormat::F32 => {
                 let sender = sender.clone();
+                let dropped_frames = dropped_frames.clone();
                 device.build_input_stream(
                     config,
                     move |data: &[f32], _| {
@@ -38,7 +45,7 @@ impl AudioInput {
                             input_sample_rate,
                             TARGET_SAMPLE_RATE,
                         );
-                        let _ = sender.try_send(resampled);
+                        send_audio_frame(&sender, resampled, &dropped_frames);
                     },
                     err_fn,
                     None,
@@ -46,6 +53,7 @@ impl AudioInput {
             }
             SampleFormat::I16 => {
                 let sender = sender.clone();
+                let dropped_frames = dropped_frames.clone();
                 device.build_input_stream(
                     config,
                     move |data: &[i16], _| {
@@ -55,7 +63,7 @@ impl AudioInput {
                             input_sample_rate,
                             TARGET_SAMPLE_RATE,
                         );
-                        let _ = sender.try_send(resampled);
+                        send_audio_frame(&sender, resampled, &dropped_frames);
                     },
                     err_fn,
                     None,
@@ -63,6 +71,7 @@ impl AudioInput {
             }
             SampleFormat::U16 => {
                 let sender = sender.clone();
+                let dropped_frames = dropped_frames.clone();
                 device.build_input_stream(
                     config,
                     move |data: &[u16], _| {
@@ -72,7 +81,7 @@ impl AudioInput {
                             input_sample_rate,
                             TARGET_SAMPLE_RATE,
                         );
-                        let _ = sender.try_send(resampled);
+                        send_audio_frame(&sender, resampled, &dropped_frames);
                     },
                     err_fn,
                     None,
@@ -146,4 +155,21 @@ fn u16_to_mono_i16(data: &[u16], channels: usize) -> Vec<i16> {
 
 fn f32_to_i16(value: f32) -> i16 {
     (value.clamp(-1.0, 1.0) * i16::MAX as f32) as i16
+}
+
+fn send_audio_frame(
+    sender: &Sender<Vec<i16>>,
+    frame: Vec<i16>,
+    dropped_frames: &AtomicU64,
+) {
+    match sender.try_send(frame) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => {
+            let dropped = dropped_frames.fetch_add(1, Ordering::Relaxed) + 1;
+            if dropped == 1 || dropped.is_multiple_of(100) {
+                warn!(dropped_frames = dropped, "音频采集队列已满, 丢弃音频帧");
+            }
+        }
+        Err(TrySendError::Disconnected(_)) => {}
+    }
 }
