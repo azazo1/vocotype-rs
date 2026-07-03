@@ -154,6 +154,16 @@ vocotype config schema
 vocotype config doctor
 ```
 
+启用后处理英文标点模式:
+
+```toml
+[post-processing]
+english-punctuation = true
+strip-trailing-period = true
+```
+
+这些选项会在词表改写之后处理最终转写文本, 可把中文标点转换为 ASCII 标点, 也可删除末尾句号.
+
 更多配置示例见 [docs/config.md](docs/config.md).
 
 ## 常用命令

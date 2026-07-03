@@ -136,13 +136,16 @@ model-revision = "asr-models"
 [asr]
 hotwords-score = 3.0
 
+[post-processing]
+english-punctuation = false
+strip-trailing-period = false
+
 [daemon]
 hotkey = "ctrl+f2"
 hotkey-mode = "pressed"
 # end-hotkey = "ctrl+f3"
 save-dataset = false
 append-newline = false
-strip-trailing-period = false
 inject-method = "auto"
 end-silence-ms = 650
 pre-roll-ms = 180

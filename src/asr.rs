@@ -12,6 +12,7 @@ use tracing::{debug, info, warn};
 
 use crate::dict::{DEFAULT_HOTWORDS_SCORE, SpeechDictionary};
 use crate::models::{AsrModelFiles, ModelStore, PuncModelFiles};
+use crate::punctuation::{convert_to_english_punctuation, strip_trailing_period};
 use crate::wav::PcmAudio;
 
 pub const TARGET_SAMPLE_RATE: u32 = 16_000;
@@ -42,12 +43,16 @@ pub struct AsrEngine {
     recognizer: OfflineRecognizer,
     punctuator: OfflinePunctuation,
     dictionary: SpeechDictionary,
+    english_punctuation: bool,
+    strip_trailing_period: bool,
 }
 
 #[derive(Clone, Debug)]
 pub struct AsrOptions {
     pub dictionary: SpeechDictionary,
     pub hotwords_score: f32,
+    pub english_punctuation: bool,
+    pub strip_trailing_period: bool,
 }
 
 impl Default for AsrOptions {
@@ -55,6 +60,8 @@ impl Default for AsrOptions {
         Self {
             dictionary: SpeechDictionary::builtin(),
             hotwords_score: DEFAULT_HOTWORDS_SCORE,
+            english_punctuation: false,
+            strip_trailing_period: false,
         }
     }
 }
@@ -75,6 +82,8 @@ impl AsrEngine {
             tokens = %asr_files.tokens.display(),
             hotwords = options.dictionary.hotword_count(),
             hotword_rewrites = options.dictionary.hotword_rewrite_count(),
+            english_punctuation = options.english_punctuation,
+            strip_trailing_period = options.strip_trailing_period,
             "ASR 模型加载完成"
         );
         if options.dictionary.hotword_count() > 0 {
@@ -88,6 +97,8 @@ impl AsrEngine {
             recognizer,
             punctuator,
             dictionary: options.dictionary,
+            english_punctuation: options.english_punctuation,
+            strip_trailing_period: options.strip_trailing_period,
         }))
     }
 
@@ -124,7 +135,15 @@ impl AsrEngine {
         let success = !raw_text.is_empty();
         let text = if success {
             let punctuated = self.restore_punctuation(&raw_text);
-            self.dictionary.rewrite_text(&punctuated)
+            let mut rewritten = self.dictionary.rewrite_text(&punctuated);
+            if self.english_punctuation {
+                rewritten = convert_to_english_punctuation(&rewritten).unwrap_or(rewritten);
+            }
+            if self.strip_trailing_period {
+                strip_trailing_period(&rewritten)
+            } else {
+                rewritten
+            }
         } else {
             raw_text.clone()
         };

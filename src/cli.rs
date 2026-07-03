@@ -331,10 +331,21 @@ pub async fn run() -> Result<()> {
     let asr_options = AsrOptions {
         dictionary: SpeechDictionary::load(cli.dict.as_deref())?,
         hotwords_score: cli.hotwords_score,
+        english_punctuation: config
+            .post_processing
+            .english_punctuation
+            .unwrap_or(false),
+        strip_trailing_period: config
+            .post_processing
+            .strip_trailing_period
+            .or(config.daemon.strip_trailing_period)
+            .unwrap_or(false),
     };
 
     match cli.command {
         Command::Daemon(args) => {
+            let mut asr_options = asr_options;
+            asr_options.strip_trailing_period = args.strip_trailing_period;
             let daemon = DaemonOptions {
                 hotkey: args.hotkey,
                 hotkey_mode: HotkeyMode::parse(&args.hotkey_mode)?,
@@ -342,7 +353,6 @@ pub async fn run() -> Result<()> {
                 save_dataset: args.save_dataset,
                 dataset_dir: args.dataset_dir,
                 append_newline: args.append_newline,
-                strip_trailing_period: args.strip_trailing_period,
                 inject_method: InjectMethod::parse(&args.inject_method),
                 end_silence_ms: args.end_silence_ms,
                 pre_roll_ms: args.pre_roll_ms,
@@ -548,6 +558,9 @@ fn write_config_doctor(
     writeln!(writer, "asr 配置")?;
     write_asr_config_status(&mut writer, matches, &loaded.config)?;
     writeln!(writer)?;
+    writeln!(writer, "post-processing 配置")?;
+    write_post_processing_config_status(&mut writer, &loaded.config)?;
+    writeln!(writer)?;
     writeln!(writer, "daemon 配置")?;
     write_daemon_config_status(&mut writer, &loaded.config)?;
     writeln!(writer)?;
@@ -616,6 +629,26 @@ fn write_asr_config_status(
     Ok(())
 }
 
+fn write_post_processing_config_status(
+    writer: &mut impl Write,
+    config: &AppConfig,
+) -> Result<()> {
+    write_value_status_without_source(
+        writer,
+        "english-punctuation",
+        config.post_processing.english_punctuation,
+    )?;
+    write_value_status_without_source(
+        writer,
+        "strip-trailing-period",
+        config
+            .post_processing
+            .strip_trailing_period
+            .or(config.daemon.strip_trailing_period),
+    )?;
+    Ok(())
+}
+
 fn write_daemon_config_status(writer: &mut impl Write, config: &AppConfig) -> Result<()> {
     let daemon = &config.daemon;
     write_env_value_status(writer, "hotkey", daemon.hotkey.clone(), "VOCOTYPE_HOTKEY")?;
@@ -632,11 +665,6 @@ fn write_daemon_config_status(writer: &mut impl Write, config: &AppConfig) -> Re
         "VOCOTYPE_DATASET_DIR",
     )?;
     write_value_status_without_source(writer, "append-newline", daemon.append_newline)?;
-    write_value_status_without_source(
-        writer,
-        "strip-trailing-period",
-        daemon.strip_trailing_period,
-    )?;
     write_env_value_status(
         writer,
         "inject-method",
@@ -774,7 +802,10 @@ fn apply_daemon_config(args: &mut DaemonArgs, matches: &ArgMatches, config: &App
     args.strip_trailing_period = merge_value(
         args.strip_trailing_period,
         matches.value_source("strip_trailing_period"),
-        daemon.strip_trailing_period,
+        config
+            .post_processing
+            .strip_trailing_period
+            .or(daemon.strip_trailing_period),
     );
     args.inject_method = merge_value(
         std::mem::take(&mut args.inject_method),
@@ -874,7 +905,7 @@ fn should_use_config(source: Option<ValueSource>) -> bool {
 #[cfg(test)]
 mod config_tests {
     use super::*;
-    use crate::config::{DaemonConfig, TranscribeConfig};
+    use crate::config::{DaemonConfig, PostProcessingConfig, TranscribeConfig};
 
     #[test]
     fn config_default_prints_template() {
@@ -930,8 +961,11 @@ mod config_tests {
                 hotkey_mode: Some("trigger-end".to_string()),
                 end_hotkey: Some("F4".to_string()),
                 append_newline: Some(true),
-                strip_trailing_period: Some(true),
                 idle_unload_secs: Some(0),
+                ..Default::default()
+            },
+            post_processing: PostProcessingConfig {
+                strip_trailing_period: Some(true),
                 ..Default::default()
             },
             ..Default::default()
@@ -1008,7 +1042,6 @@ mod config_tests {
                 format: Some("srt".to_string()),
                 pretty: Some(true),
                 subtitle_max_chars: Some(40),
-                ..Default::default()
             },
             ..Default::default()
         };

@@ -11,6 +11,7 @@ mod inject;
 mod logging;
 mod models;
 mod overlay;
+mod punctuation;
 mod subtitle;
 mod vad;
 mod wav;

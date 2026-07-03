@@ -19,6 +19,10 @@ model-revision = "asr-models"
 [asr]
 hotwords-score = 3.0
 
+[post-processing]
+english-punctuation = false
+strip-trailing-period = false
+
 [daemon]
 # 热键可以写单键或组合键. 组合键用 + 连接, 修饰键在前, 主键在后.
 # 示例: "F2", "ctrl+f2", "cmdorctrl+space", "shift+alt+KeyQ".
@@ -30,7 +34,6 @@ hotkey-mode = "pressed"
 save-dataset = false
 # dataset-dir = "/path/to/dataset"
 append-newline = false
-strip-trailing-period = false
 inject-method = "auto"
 end-silence-ms = 650
 pre-roll-ms = 180
@@ -84,6 +87,22 @@ pub fn config_schema() -> &'static str {
         }
       }
     },
+    "post-processing": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "english-punctuation": {
+          "type": "boolean",
+          "default": false,
+          "description": "是否把最终转写文本中的中文标点转换为 ASCII 标点."
+        },
+        "strip-trailing-period": {
+          "type": "boolean",
+          "default": false,
+          "description": "是否删除最终转写文本末尾的句号."
+        }
+      }
+    },
     "daemon": {
       "type": "object",
       "additionalProperties": false,
@@ -133,11 +152,6 @@ pub fn config_schema() -> &'static str {
           "type": "boolean",
           "default": false,
           "description": "注入文本后是否追加换行."
-        },
-        "strip-trailing-period": {
-          "type": "boolean",
-          "default": false,
-          "description": "注入文本前是否删除末尾的句号."
         },
         "inject-method": {
           "type": "string",
@@ -230,6 +244,8 @@ pub struct AppConfig {
     #[serde(alias = "dict-path")]
     pub dict_path: Option<PathBuf>,
     pub asr: AsrConfig,
+    #[serde(alias = "post-processing")]
+    pub post_processing: PostProcessingConfig,
     pub daemon: DaemonConfig,
     pub transcribe: TranscribeConfig,
 }
@@ -239,6 +255,15 @@ pub struct AppConfig {
 pub struct AsrConfig {
     #[serde(alias = "hotwords-score")]
     pub hotwords_score: Option<f32>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PostProcessingConfig {
+    #[serde(alias = "english-punctuation")]
+    pub english_punctuation: Option<bool>,
+    #[serde(alias = "strip-trailing-period")]
+    pub strip_trailing_period: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -355,12 +380,15 @@ dict-path = "/tmp/vocotype-dict.toml"
 [asr]
 hotwords-score = 4.5
 
+[post-processing]
+english-punctuation = true
+strip-trailing-period = true
+
 [daemon]
 idle-unload-secs = 42
 tail-padding-ms = 250
 hotkey-mode = "toggle"
 end-hotkey = "F3"
-strip-trailing-period = true
 
 [transcribe]
 subtitle-max-chars = 32
@@ -375,11 +403,13 @@ subtitle-max-chars = 32
             Some(PathBuf::from("/tmp/vocotype-dict.toml"))
         );
         assert_eq!(config.asr.hotwords_score, Some(4.5));
+        assert_eq!(config.post_processing.english_punctuation, Some(true));
+        assert_eq!(config.post_processing.strip_trailing_period, Some(true));
         assert_eq!(config.daemon.idle_unload_secs, Some(42));
         assert_eq!(config.daemon.tail_padding_ms, Some(250));
         assert_eq!(config.daemon.hotkey_mode.as_deref(), Some("toggle"));
         assert_eq!(config.daemon.end_hotkey.as_deref(), Some("F3"));
-        assert_eq!(config.daemon.strip_trailing_period, Some(true));
+        assert_eq!(config.daemon.strip_trailing_period, None);
         assert_eq!(config.transcribe.subtitle_max_chars, Some(32));
     }
 
@@ -392,6 +422,10 @@ dict_path = "/tmp/vocotype-dict.toml"
 
 [asr]
 hotwords_score = 2.5
+
+[post_processing]
+english_punctuation = true
+strip_trailing_period = true
 
 [daemon]
 save_dataset = true
@@ -406,6 +440,8 @@ dataset_dir = "/tmp/dataset"
             Some(PathBuf::from("/tmp/vocotype-dict.toml"))
         );
         assert_eq!(config.asr.hotwords_score, Some(2.5));
+        assert_eq!(config.post_processing.english_punctuation, Some(true));
+        assert_eq!(config.post_processing.strip_trailing_period, Some(true));
         assert_eq!(config.daemon.save_dataset, Some(true));
         assert_eq!(config.daemon.dataset_dir, Some(PathBuf::from("/tmp/dataset")));
     }

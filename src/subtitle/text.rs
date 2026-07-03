@@ -136,17 +136,17 @@ fn is_sentence_punctuation(ch: char) -> bool {
             | ','
             | ';'
             | ':'
-            | '\u{ff0c}'
-            | '\u{3002}'
-            | '\u{ff1f}'
-            | '\u{ff01}'
-            | '\u{ff1b}'
-            | '\u{ff1a}'
+            | '，'
+            | '。'
+            | '？'
+            | '！'
+            | '；'
+            | '：'
     )
 }
 
 fn is_soft_break(ch: char) -> bool {
-    ch.is_whitespace() || matches!(ch, ',' | ';' | ':' | '\u{ff0c}' | '\u{ff1b}' | '\u{ff1a}')
+    ch.is_whitespace() || matches!(ch, ',' | ';' | ':' | '，' | '；' | '：')
 }
 
 pub fn default_max_chars() -> usize {
