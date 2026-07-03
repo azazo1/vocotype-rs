@@ -280,8 +280,6 @@ pub struct DaemonConfig {
     pub dataset_dir: Option<PathBuf>,
     #[serde(alias = "append-newline")]
     pub append_newline: Option<bool>,
-    #[serde(alias = "strip-trailing-period")]
-    pub strip_trailing_period: Option<bool>,
     #[serde(alias = "inject-method")]
     pub inject_method: Option<String>,
     #[serde(alias = "end-silence-ms")]
@@ -409,8 +407,19 @@ subtitle-max-chars = 32
         assert_eq!(config.daemon.tail_padding_ms, Some(250));
         assert_eq!(config.daemon.hotkey_mode.as_deref(), Some("toggle"));
         assert_eq!(config.daemon.end_hotkey.as_deref(), Some("F3"));
-        assert_eq!(config.daemon.strip_trailing_period, None);
         assert_eq!(config.transcribe.subtitle_max_chars, Some(32));
+    }
+
+    #[test]
+    fn rejects_legacy_daemon_strip_trailing_period() {
+        let config = AppConfig::from_toml(
+            r#"
+[daemon]
+strip-trailing-period = true
+"#,
+        );
+
+        assert!(config.is_err());
     }
 
     #[test]

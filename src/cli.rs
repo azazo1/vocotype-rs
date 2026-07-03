@@ -338,7 +338,6 @@ pub async fn run() -> Result<()> {
         strip_trailing_period: config
             .post_processing
             .strip_trailing_period
-            .or(config.daemon.strip_trailing_period)
             .unwrap_or(false),
     };
 
@@ -641,10 +640,7 @@ fn write_post_processing_config_status(
     write_value_status_without_source(
         writer,
         "strip-trailing-period",
-        config
-            .post_processing
-            .strip_trailing_period
-            .or(config.daemon.strip_trailing_period),
+        config.post_processing.strip_trailing_period,
     )?;
     Ok(())
 }
@@ -802,10 +798,7 @@ fn apply_daemon_config(args: &mut DaemonArgs, matches: &ArgMatches, config: &App
     args.strip_trailing_period = merge_value(
         args.strip_trailing_period,
         matches.value_source("strip_trailing_period"),
-        config
-            .post_processing
-            .strip_trailing_period
-            .or(daemon.strip_trailing_period),
+        config.post_processing.strip_trailing_period,
     );
     args.inject_method = merge_value(
         std::mem::take(&mut args.inject_method),
