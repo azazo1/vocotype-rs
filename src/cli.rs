@@ -50,7 +50,7 @@ pub struct Cli {
         default_value = DEFAULT_REVISION,
         global = true,
         help = "指定模型版本标签",
-        long_help = "指定模型 manifest 记录的 revision. 默认使用当前 sherpa-onnx release 标签."
+        long_help = "指定 sherpa-onnx 模型 manifest 使用的 revision. 默认值为当前 sherpa-onnx release 标签."
     )]
     pub model_revision: String,
 
@@ -58,7 +58,7 @@ pub struct Cli {
         long,
         env = "VOCOTYPE_ASR_BACKEND",
         value_enum,
-        default_value_t = AsrBackend::Sherpa,
+        default_value_t = AsrBackend::Iflytek,
         global = true,
         help = "选择 ASR 后端",
         long_help = "选择 ASR 后端. sherpa 使用现有 sherpa-onnx 模型, iflytek 使用纯 Rust EdgeEsr 接入."
@@ -89,7 +89,7 @@ pub struct Cli {
         default_value_t = DEFAULT_HOTWORDS_SCORE,
         global = true,
         help = "指定 hotwords 加权分数",
-        long_help = "指定 sherpa-onnx hotwords 加权分数. 仅支持 contextual biasing 的模型会使用该分数, 当前默认 Paraformer 模型使用词表后处理."
+        long_help = "指定 sherpa-onnx hotwords 加权分数. 仅支持 contextual biasing 的模型会使用该分数, sherpa-onnx Paraformer 模型使用词表后处理."
     )]
     pub hotwords_score: f32,
 
@@ -951,6 +951,16 @@ fn should_use_config(source: Option<ValueSource>) -> bool {
 mod config_tests {
     use super::*;
     use crate::config::{DaemonConfig, PostProcessingConfig, TranscribeConfig};
+
+    #[test]
+    fn cli_defaults_to_iflytek_backend() {
+        let matches = Cli::command()
+            .try_get_matches_from(["vocotype", "daemon"])
+            .unwrap();
+        let cli = Cli::from_arg_matches(&matches).unwrap();
+
+        assert_eq!(cli.asr_backend, AsrBackend::Iflytek);
+    }
 
     #[test]
     fn config_default_prints_template() {

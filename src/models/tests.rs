@@ -29,7 +29,7 @@ fn cli_paths_override_defaults() {
 }
 
 #[test]
-fn missing_models_reports_required_kinds() {
+fn default_missing_models_reports_required_kinds() {
     let dir = tempfile::tempdir().unwrap();
     let store = ModelStore::new(&ModelOptions {
         model_dir: Some(dir.path().join("models")),
@@ -37,7 +37,7 @@ fn missing_models_reports_required_kinds() {
         revision: DEFAULT_REVISION.to_string(),
     });
     let missing = store.missing_models();
-    assert_eq!(missing, vec![ModelKind::Asr, ModelKind::Vad, ModelKind::Punc]);
+    assert_eq!(missing, vec![ModelKind::Iflytek]);
 }
 
 #[test]
@@ -98,7 +98,7 @@ fn vad_ready_requires_valid_checksum() {
     std::fs::create_dir_all(&vad_dir).unwrap();
     std::fs::write(vad_dir.join(VAD_FILE_NAME), []).unwrap();
     assert_eq!(
-        store.missing_models(),
+        store.missing_models_for(AsrBackend::Sherpa),
         vec![ModelKind::Asr, ModelKind::Vad, ModelKind::Punc]
     );
 }

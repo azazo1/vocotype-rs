@@ -251,7 +251,7 @@ hotwords = [
   "URL",
 ]
 
-# 当前默认 Paraformer 模型不支持 sherpa contextual biasing.
+# sherpa-onnx Paraformer 模型不支持 sherpa contextual biasing.
 # hotwords 用于后处理大小写和拆字母归一化.
 
 # 仅导入英文 Rime 词条.

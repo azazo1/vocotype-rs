@@ -19,7 +19,7 @@
 ## Models
 - `--model-dir` 或 `VOCOTYPE_MODEL_DIR` 指定模型加载根目录.
 - `--model-cache-dir` 或 `VOCOTYPE_MODEL_CACHE_DIR` 指定下载缓存目录.
-- `--model-revision` 或 `VOCOTYPE_MODEL_REVISION` 目前默认记录为 `asr-models`, 对应 sherpa-onnx release tag.
+- `--model-revision` 或 `VOCOTYPE_MODEL_REVISION` 的默认值为 `asr-models`, 用于 sherpa-onnx release tag.
 - 下载后写入 `manifest.json`, 记录模型来源, 文件校验和和下载时间.
 - ASR 使用 `sherpa-onnx-paraformer-zh-2024-03-09`.
 - ASR 加载时优先使用 `model.onnx`, 其次使用 `model.int8.onnx`, 也会扫描目录下的 `.onnx` 文件.

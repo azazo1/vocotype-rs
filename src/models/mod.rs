@@ -145,10 +145,6 @@ impl ModelStore {
         }
     }
 
-    pub fn download_hint(&self) -> String {
-        self.download_hint_for(AsrBackend::Sherpa)
-    }
-
     pub fn download_hint_for(&self, backend: AsrBackend) -> String {
         format!(
             "vocotype models download --backend {} --model-dir {}",
@@ -175,7 +171,7 @@ impl ModelStore {
 
     #[cfg(test)]
     pub fn missing_models(&self) -> Vec<ModelKind> {
-        self.missing_models_for(AsrBackend::Sherpa)
+        self.missing_models_for(AsrBackend::default())
     }
 
     pub fn missing_models_for(&self, backend: AsrBackend) -> Vec<ModelKind> {
@@ -294,7 +290,7 @@ impl ModelStore {
                 "VAD 模型校验失败: expected {}, got {}. 请重新运行: {}",
                 VAD_SHA256,
                 checksum,
-                self.download_hint()
+                self.download_hint_for(AsrBackend::Sherpa)
             );
         }
         Ok(())

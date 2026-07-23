@@ -93,7 +93,7 @@ pub struct AsrOptions {
 impl Default for AsrOptions {
     fn default() -> Self {
         Self {
-            backend: AsrBackend::Sherpa,
+            backend: AsrBackend::Iflytek,
             dictionary: SpeechDictionary::builtin(),
             hotwords_score: DEFAULT_HOTWORDS_SCORE,
             english_punctuation: false,
@@ -563,6 +563,11 @@ fn i16_to_f32(samples: &[i16]) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn defaults_to_iflytek_backend() {
+        assert_eq!(AsrOptions::default().backend, AsrBackend::Iflytek);
+    }
 
     #[test]
     fn converts_i16_to_normalized_f32() {

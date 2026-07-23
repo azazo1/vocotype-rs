@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "lowercase")]
 #[clap(rename_all = "lower")]
 pub enum AsrBackend {
-    #[default]
     Sherpa,
+    #[default]
     Iflytek,
 }
 
@@ -29,5 +29,10 @@ mod tests {
     fn backend_labels_are_stable() {
         assert_eq!(AsrBackend::Sherpa.to_string(), "sherpa");
         assert_eq!(AsrBackend::Iflytek.to_string(), "iflytek");
+    }
+
+    #[test]
+    fn default_backend_is_iflytek() {
+        assert_eq!(AsrBackend::default(), AsrBackend::Iflytek);
     }
 }

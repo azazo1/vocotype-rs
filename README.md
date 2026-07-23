@@ -1,6 +1,6 @@
 # VocoType
 
-VocoType 是一个本地语音转写和文本注入工具. 默认使用 sherpa-onnx, 也可以选择纯 Rust 接入的讯飞 EdgeEsr 后端完成语音识别, VAD 分段, 标点恢复, 热键录音, 文本注入和 SRT 字幕输出.
+VocoType 是一个本地语音转写和文本注入工具. 默认使用纯 Rust 接入的讯飞 EdgeEsr 后端, 也可以选择 sherpa-onnx 完成语音识别, VAD 分段, 标点恢复, 热键录音, 文本注入和 SRT 字幕输出.
 
 本项目是 [vocotype-cli](https://github.com/233stone/vocotype-cli) 的 Rust 实现版本.
 
@@ -21,7 +21,7 @@ VocoType 是一个本地语音转写和文本注入工具. 默认使用 sherpa-o
 
 两种后端的能力差异, 模型组成和流式行为见 [ASR 后端对比](docs/asr-backends.md).
 
-安装或构建后, 先下载模型:
+安装或构建后, 先下载默认的讯飞模型:
 
 ```shell
 vocotype models download
@@ -33,19 +33,19 @@ vocotype models download
 vocotype models doctor
 ```
 
-下载并检查讯飞模型:
+下载并检查 sherpa-onnx 模型:
 
 ```shell
-vocotype models download --backend iflytek
-vocotype models doctor --backend iflytek
+vocotype models download --backend sherpa
+vocotype models doctor --backend sherpa
 ```
 
 讯飞模型不提交到 Git 或 Git LFS, 由当前仓库的独立 `models-iflytek-v1.0.0` Release 提供. 模型包只包含 ONNX 模型和后处理数据, Rust custom-op 直接编译进 `vocotype` 可执行文件.
 
-使用讯飞后端转写:
+使用 sherpa-onnx 后端转写:
 
 ```shell
-vocotype --asr-backend iflytek transcribe input.wav
+vocotype --asr-backend sherpa transcribe input.wav
 ```
 
 生成可编辑的词汇表模板:
@@ -108,7 +108,7 @@ vocotype transcribe input.wav --format srt --output input.srt
 - `rewrites`: 把逐字母转写结果改成目标写法, 例如 `g p t` 到 `GPT`.
 - `rime-imports`: 从 Rime 英文 `.dict.yaml` 导入 hotwords.
 
-当前默认 Paraformer ASR 模型不支持 sherpa contextual biasing, 所以 hotwords 不会直接改变 decoder 搜索结果. 如果需要处理更自由的误识别, 用 `[rewrites]` 写显式替换规则.
+sherpa-onnx Paraformer ASR 模型不支持 sherpa contextual biasing, 所以 hotwords 不会直接改变 decoder 搜索结果. 如果需要处理更自由的误识别, 用 `[rewrites]` 写显式替换规则.
 
 示例:
 
