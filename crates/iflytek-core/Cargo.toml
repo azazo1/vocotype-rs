@@ -1,0 +1,12 @@
+[package]
+name = "iflytek-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+flate2 = "1"
+half = "2"
+libm = "0.2"
+ndarray = "0.17"
+ndarray-npy = "0.10"

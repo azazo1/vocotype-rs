@@ -60,9 +60,12 @@ pub struct DaemonOptions {
 
 pub async fn run_daemon(store: ModelStore, options: DaemonOptions) -> Result<()> {
     store.paths.ensure_dirs()?;
-    if let Err(error) = store.verify_required() {
+    if let Err(error) = store.verify_required_for(options.asr_options.backend) {
         error!(%error, "模型缺失");
-        eprintln!("模型缺失, 请先运行: {}", store.download_hint());
+        eprintln!(
+            "模型缺失, 请先运行: {}",
+            store.download_hint_for(options.asr_options.backend)
+        );
         return Err(error);
     }
 

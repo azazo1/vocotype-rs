@@ -1,5 +1,6 @@
 mod app;
 mod asr;
+mod asr_backend;
 mod audio;
 mod cli;
 mod config;

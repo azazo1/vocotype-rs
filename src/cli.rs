@@ -7,6 +7,7 @@ use clap::{ArgMatches, Args, CommandFactory, FromArgMatches, Parser, Subcommand,
 use clap_complete::{Shell, generate};
 
 use crate::asr::{AsrEngine, AsrOptions};
+use crate::asr_backend::AsrBackend;
 use crate::audio::list_input_devices;
 use crate::config::{AppConfig, config_schema, default_config_path, default_config_template};
 use crate::daemon::{DaemonOptions, HotkeyMode, run_daemon};
@@ -22,7 +23,7 @@ use crate::subtitle::{SubtitleOptions, transcribe_srt};
     name = "vocotype",
     version,
     about = "本地语音转写和文本注入工具",
-    long_about = "VocoType 使用本地 sherpa-onnx 模型完成录音转写, VAD 分段, 标点恢复, 文本注入和 SRT 字幕输出."
+    long_about = "VocoType 使用本地 sherpa-onnx 或讯飞 EdgeEsr 模型完成录音转写, VAD 分段, 标点恢复, 文本注入和 SRT 字幕输出."
 )]
 pub struct Cli {
     #[arg(
@@ -30,7 +31,7 @@ pub struct Cli {
         env = "VOCOTYPE_MODEL_DIR",
         global = true,
         help = "指定模型加载目录",
-        long_help = "指定 ASR, VAD 和 PUNC 模型的加载根目录. 也可以通过 VOCOTYPE_MODEL_DIR 设置."
+        long_help = "指定本地 ASR 后端模型的加载根目录. 也可以通过 VOCOTYPE_MODEL_DIR 设置."
     )]
     pub model_dir: Option<PathBuf>,
 
@@ -52,6 +53,17 @@ pub struct Cli {
         long_help = "指定模型 manifest 记录的 revision. 默认使用当前 sherpa-onnx release 标签."
     )]
     pub model_revision: String,
+
+    #[arg(
+        long,
+        env = "VOCOTYPE_ASR_BACKEND",
+        value_enum,
+        default_value_t = AsrBackend::Sherpa,
+        global = true,
+        help = "选择 ASR 后端",
+        long_help = "选择 ASR 后端. sherpa 使用现有 sherpa-onnx 模型, iflytek 使用纯 Rust EdgeEsr 接入."
+    )]
+    pub asr_backend: AsrBackend,
 
     #[arg(
         long,
@@ -236,13 +248,21 @@ impl TranscribeArgs {
 
 #[derive(Args, Debug)]
 pub struct ModelsCommand {
+    #[arg(
+        long,
+        value_enum,
+        global = true,
+        help = "选择要下载或检查的模型后端"
+    )]
+    pub backend: Option<AsrBackend>,
+
     #[command(subcommand)]
     pub command: ModelsSubcommand,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum ModelsSubcommand {
-    #[command(about = "下载 ASR, VAD 和 PUNC 模型")]
+    #[command(about = "下载所选 ASR 后端需要的模型")]
     Download,
     #[command(about = "检查模型目录和运行时加载能力")]
     Doctor,
@@ -329,6 +349,7 @@ pub async fn run() -> Result<()> {
     };
     let store = ModelStore::new(&options);
     let asr_options = AsrOptions {
+        backend: cli.asr_backend,
         dictionary: SpeechDictionary::load(cli.dict.as_deref())?,
         hotwords_score: cli.hotwords_score,
         english_punctuation: config
@@ -395,13 +416,23 @@ pub async fn run() -> Result<()> {
         }
         Command::Models(models) => match models.command {
             ModelsSubcommand::Download => {
-                let manifest = store.download_all().await?;
+                let backend = models.backend.unwrap_or(cli.asr_backend);
+                let manifest = store.download_backend(backend).await?;
                 println!("{}", serde_json::to_string_pretty(&manifest)?);
                 Ok(())
             }
             ModelsSubcommand::Doctor => {
-                crate::models::write_doctor_report(&store, std::io::stdout())?;
-                crate::models::loadability_report(&store, std::io::stdout())?;
+                let backend = models.backend.unwrap_or(cli.asr_backend);
+                crate::models::write_doctor_report_for(
+                    &store,
+                    backend,
+                    std::io::stdout(),
+                )?;
+                crate::models::loadability_report_for(
+                    &store,
+                    backend,
+                    std::io::stdout(),
+                )?;
                 Ok(())
             }
         },
@@ -462,6 +493,11 @@ fn apply_config(cli: &mut Cli, matches: &ArgMatches, config: &AppConfig) -> Resu
         std::mem::take(&mut cli.model_revision),
         matches.value_source("model_revision"),
         config.model_revision.clone(),
+    );
+    cli.asr_backend = merge_value(
+        cli.asr_backend,
+        matches.value_source("asr_backend"),
+        config.asr.backend,
     );
     cli.dict = merge_option(
         cli.dict.take(),
@@ -619,6 +655,12 @@ fn write_asr_config_status(
     matches: &ArgMatches,
     config: &AppConfig,
 ) -> Result<()> {
+    write_value_status(
+        writer,
+        "backend",
+        config.asr.backend,
+        matches.value_source("asr_backend"),
+    )?;
     write_value_status(
         writer,
         "hotwords-score",

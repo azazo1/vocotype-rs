@@ -10,6 +10,7 @@ use sherpa_onnx::{
 };
 use tracing::{debug, info, warn};
 
+use crate::asr_backend::AsrBackend;
 use crate::dict::{DEFAULT_HOTWORDS_SCORE, SpeechDictionary};
 use crate::models::{AsrModelFiles, ModelStore, PuncModelFiles};
 use crate::punctuation::{convert_to_english_punctuation, strip_trailing_period};
@@ -40,15 +41,23 @@ impl TranscriptionResult {
 }
 
 pub struct AsrEngine {
-    recognizer: OfflineRecognizer,
-    punctuator: OfflinePunctuation,
+    backend: BackendEngine,
     dictionary: SpeechDictionary,
     english_punctuation: bool,
     strip_trailing_period: bool,
 }
 
+enum BackendEngine {
+    Sherpa {
+        recognizer: OfflineRecognizer,
+        punctuator: OfflinePunctuation,
+    },
+    Iflytek(Arc<iflytek_runtime::EdgeEsrRuntime>),
+}
+
 #[derive(Clone, Debug)]
 pub struct AsrOptions {
+    pub backend: AsrBackend,
     pub dictionary: SpeechDictionary,
     pub hotwords_score: f32,
     pub english_punctuation: bool,
@@ -58,6 +67,7 @@ pub struct AsrOptions {
 impl Default for AsrOptions {
     fn default() -> Self {
         Self {
+            backend: AsrBackend::Sherpa,
             dictionary: SpeechDictionary::builtin(),
             hotwords_score: DEFAULT_HOTWORDS_SCORE,
             english_punctuation: false,
@@ -67,35 +77,54 @@ impl Default for AsrOptions {
 }
 
 impl AsrEngine {
-    pub fn load(store: ModelStore) -> Result<Arc<Self>> {
-        Self::load_with_options(store, AsrOptions::default())
-    }
-
     pub fn load_with_options(store: ModelStore, options: AsrOptions) -> Result<Arc<Self>> {
-        store.verify_required()?;
-        let asr_files = store.asr_model_files()?;
-        let punc_files = store.punc_model_files()?;
-        let recognizer = create_recognizer(&asr_files, options.hotwords_score)?;
-        let punctuator = create_punctuator(&punc_files)?;
-        info!(
-            model = %asr_files.model.display(),
-            tokens = %asr_files.tokens.display(),
-            hotwords = options.dictionary.hotword_count(),
-            hotword_rewrites = options.dictionary.hotword_rewrite_count(),
-            english_punctuation = options.english_punctuation,
-            strip_trailing_period = options.strip_trailing_period,
-            "ASR 模型加载完成"
-        );
-        if options.dictionary.hotword_count() > 0 {
-            info!("ASR 模型不支持 sherpa contextual biasing, 使用词表后处理");
-        }
-        info!(
-            model = %punc_files.model.display(),
-            "PUNC 模型加载完成"
-        );
+        store.verify_required_for(options.backend)?;
+        let backend = match options.backend {
+            AsrBackend::Sherpa => {
+                let asr_files = store.asr_model_files()?;
+                let punc_files = store.punc_model_files()?;
+                let recognizer = create_recognizer(&asr_files, options.hotwords_score)?;
+                let punctuator = create_punctuator(&punc_files)?;
+                info!(
+                    backend = %options.backend,
+                    model = %asr_files.model.display(),
+                    tokens = %asr_files.tokens.display(),
+                    hotwords = options.dictionary.hotword_count(),
+                    hotword_rewrites = options.dictionary.hotword_rewrite_count(),
+                    english_punctuation = options.english_punctuation,
+                    strip_trailing_period = options.strip_trailing_period,
+                    "ASR 模型加载完成"
+                );
+                if options.dictionary.hotword_count() > 0 {
+                    info!("ASR 模型不支持 sherpa contextual biasing, 使用词表后处理");
+                }
+                info!(model = %punc_files.model.display(), "PUNC 模型加载完成");
+                BackendEngine::Sherpa {
+                    recognizer,
+                    punctuator,
+                }
+            }
+            AsrBackend::Iflytek => {
+                let files = store.iflytek_model_files()?;
+                let runtime = iflytek_runtime::EdgeEsrRuntime::load(
+                    files,
+                    iflytek_runtime::EdgeEsrOptions {
+                        postprocess: iflytek_core::PostprocessOptions {
+                            english_punctuation: options.english_punctuation,
+                            strip_trailing_period: options.strip_trailing_period,
+                        },
+                    },
+                )?;
+                info!(
+                    backend = %options.backend,
+                    model = %runtime.files().root.display(),
+                    "ASR 模型加载完成"
+                );
+                BackendEngine::Iflytek(runtime)
+            }
+        };
         Ok(Arc::new(Self {
-            recognizer,
-            punctuator,
+            backend,
             dictionary: options.dictionary,
             english_punctuation: options.english_punctuation,
             strip_trailing_period: options.strip_trailing_period,
@@ -118,16 +147,35 @@ impl AsrEngine {
         } else {
             crate::wav::resample_linear_i16(&audio.samples, audio.sample_rate, TARGET_SAMPLE_RATE)
         };
-        let samples = i16_to_f32(&samples_i16);
-        let stream = self.recognizer.create_stream();
-        stream.accept_waveform(TARGET_SAMPLE_RATE as i32, &samples);
-        self.recognizer.decode(&stream);
-        let result = stream
-            .get_result()
-            .ok_or_else(|| anyhow!("ASR 解码没有返回结果"))?;
-        let raw_text = result.text.trim().to_string();
-        let tokens = result.tokens;
-        let token_timestamps = result.timestamps;
+        let decoded = match &self.backend {
+            BackendEngine::Sherpa { recognizer, .. } => {
+                let samples = i16_to_f32(&samples_i16);
+                let stream = recognizer.create_stream();
+                stream.accept_waveform(TARGET_SAMPLE_RATE as i32, &samples);
+                recognizer.decode(&stream);
+                let result = stream
+                    .get_result()
+                    .ok_or_else(|| anyhow!("ASR 解码没有返回结果"))?;
+                DecodedResult {
+                    raw_text: result.text.trim().to_string(),
+                    tokens: result.tokens,
+                    token_timestamps: result.timestamps,
+                    confidence: 1.0,
+                }
+            }
+            BackendEngine::Iflytek(runtime) => {
+                let result = runtime.transcribe_pcm(&samples_i16, TARGET_SAMPLE_RATE)?;
+                DecodedResult {
+                    raw_text: result.text.trim().to_string(),
+                    tokens: result.tokens,
+                    token_timestamps: result.token_timestamps,
+                    confidence: result.confidence,
+                }
+            }
+        };
+        let raw_text = decoded.raw_text;
+        let tokens = decoded.tokens;
+        let token_timestamps = decoded.token_timestamps;
         let latency = start.elapsed().as_secs_f32();
         let duration = audio.duration_seconds();
         let duration_label = format!("{:.2}", duration);
@@ -171,7 +219,7 @@ impl AsrEngine {
             token_timestamps,
             duration,
             inference_latency: latency,
-            confidence: if success { 1.0 } else { 0.0 },
+            confidence: if success { decoded.confidence } else { 0.0 },
             error: if success {
                 None
             } else {
@@ -181,14 +229,26 @@ impl AsrEngine {
     }
 
     fn restore_punctuation(&self, text: &str) -> String {
-        match self.punctuator.add_punctuation(text) {
-            Some(text) => text.trim().to_string(),
-            None => {
-                warn!("标点恢复失败, 使用原始转写文本");
-                text.to_string()
+        match &self.backend {
+            BackendEngine::Sherpa { punctuator, .. } => {
+                match punctuator.add_punctuation(text) {
+                    Some(text) => text.trim().to_string(),
+                    None => {
+                        warn!("标点恢复失败, 使用原始转写文本");
+                        text.to_string()
+                    }
+                }
             }
+            BackendEngine::Iflytek(_) => text.to_string(),
         }
     }
+}
+
+struct DecodedResult {
+    raw_text: String,
+    tokens: Vec<String>,
+    token_timestamps: Option<Vec<f32>>,
+    confidence: f32,
 }
 
 fn create_recognizer(files: &AsrModelFiles, hotwords_score: f32) -> Result<OfflineRecognizer> {

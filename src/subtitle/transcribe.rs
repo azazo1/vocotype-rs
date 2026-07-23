@@ -32,12 +32,18 @@ pub fn transcribe_srt(
     audio: &Path,
     options: SubtitleOptions,
 ) -> Result<String> {
-    store.verify_required()?;
-    store.verify_vad_checksum()?;
+    store.verify_required_for(options.asr_options.backend)?;
+    if options.asr_options.backend == crate::asr_backend::AsrBackend::Sherpa {
+        store.verify_vad_checksum()?;
+    }
     let pcm = crate::wav::read_wav_mono_i16(audio, TARGET_SAMPLE_RATE)?;
     let engine = AsrEngine::load_with_options(store.clone(), options.asr_options.clone())?;
-    let mut segmenter = VadSegmenter::new(VadConfig::default(), &store.vad_model_path()?)?;
-    let segments = segment_audio(&mut segmenter, &pcm.samples);
+    let mut segmenter = VadSegmenter::new_for_backend(
+        options.asr_options.backend,
+        VadConfig::default(),
+        &store.vad_model_path_for(options.asr_options.backend)?,
+    )?;
+    let segments = segment_audio(&mut segmenter, &pcm.samples)?;
 
     info!(
         audio = %audio.display(),
@@ -76,15 +82,15 @@ pub fn transcribe_srt(
     Ok(render_srt(&cues))
 }
 
-fn segment_audio(segmenter: &mut VadSegmenter, samples: &[i16]) -> Vec<SpeechSegment> {
+fn segment_audio(segmenter: &mut VadSegmenter, samples: &[i16]) -> Result<Vec<SpeechSegment>> {
     const FRAME_SAMPLES: usize = 512;
 
     let mut output = Vec::new();
     for frame in samples.chunks(FRAME_SAMPLES) {
-        output.extend(segmenter.push(frame));
+        output.extend(segmenter.push(frame)?);
     }
-    output.extend(segmenter.finish());
-    output
+    output.extend(segmenter.finish()?);
+    Ok(output)
 }
 
 fn push_segment_cues(

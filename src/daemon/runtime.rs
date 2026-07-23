@@ -155,7 +155,7 @@ fn process_audio_frame(
         }
     };
     overlay.set(overlay_state(state, mode));
-    for segment in segmenter.push(&frame) {
+    for segment in segmenter.push(&frame)? {
         submit_segment(segment_tx, state, overlay, segment)?;
     }
     Ok(())
@@ -322,7 +322,7 @@ fn end_capture(
             Duration::from_millis(tail_padding_ms as u64),
         )?;
     }
-    for segment in segmenter.finish() {
+    for segment in segmenter.finish()? {
         submit_segment(segment_tx, state, overlay, segment)?;
     }
     if let Some(input) = capture.audio_input.take() {

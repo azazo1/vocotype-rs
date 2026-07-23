@@ -1,0 +1,15 @@
+[package]
+name = "iflytek-runtime"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+half = "2"
+iflytek-core = { path = "../iflytek-core" }
+iflytek-ops = { path = "../iflytek-ops" }
+ndarray = "0.17"
+ndarray-npy = "0.10"
+ort = { version = "2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "half", "alternative-backend", "api-24"] }
+ort-sys = { version = "2.0.0-rc.12", default-features = false, features = ["api-24", "disable-linking"] }
+tracing = "0.1"

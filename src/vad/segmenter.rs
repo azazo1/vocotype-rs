@@ -7,7 +7,7 @@ use super::audio::{i16_to_f32, path_string, samples_to_ms};
 use super::config::VadConfig;
 use super::segment::{SegmentReason, SpeechSegment, expand_bounds};
 
-pub struct VadSegmenter {
+pub(crate) struct SherpaVadSegmenter {
     config: VadConfig,
     detector: VoiceActivityDetector,
     input_samples: Vec<i16>,
@@ -15,7 +15,7 @@ pub struct VadSegmenter {
     emitted_until: usize,
 }
 
-impl VadSegmenter {
+impl SherpaVadSegmenter {
     pub fn new(config: VadConfig, model_path: &Path) -> Result<Self> {
         let vad_config = VadModelConfig {
             sample_rate: config.sample_rate as i32,

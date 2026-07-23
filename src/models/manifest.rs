@@ -5,15 +5,17 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use tracing::info;
 
+use crate::asr_backend::AsrBackend;
+
 use super::checksum::hash_model_files;
 use super::{ManifestModel, ModelKind, ModelManifest, ModelStore};
 
 impl ModelStore {
-    pub fn write_manifest(&self) -> Result<ModelManifest> {
+    pub fn write_manifest_for(&self, backend: AsrBackend) -> Result<ModelManifest> {
         let started = Instant::now();
         info!(path = %self.manifest_path().display(), "开始生成模型 manifest");
         let mut models = BTreeMap::new();
-        for kind in ModelKind::all() {
+        for kind in ModelKind::for_backend(backend).iter().copied() {
             let dir = self.model_dir(kind);
             let files = hash_model_files(kind, &dir)?;
             models.insert(
@@ -27,7 +29,10 @@ impl ModelStore {
         }
 
         let manifest = ModelManifest {
-            revision: self.revision.clone(),
+            revision: match backend {
+                AsrBackend::Sherpa => self.revision.clone(),
+                AsrBackend::Iflytek => iflytek_runtime::MODEL_RELEASE_TAG.to_string(),
+            },
             downloaded_at: Utc::now(),
             models,
         };

@@ -1,0 +1,11 @@
+[package]
+name = "iflytek-ops"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+half = "2"
+iflytek-core = { path = "../iflytek-core" }
+ort = { version = "2.0.0-rc.12", default-features = false, features = ["std", "half", "alternative-backend", "api-24"] }
+tracing = "0.1"

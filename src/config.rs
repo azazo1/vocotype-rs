@@ -4,6 +4,8 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use tracing::info;
 
+use crate::asr_backend::AsrBackend;
+
 pub const CONFIG_DIR_NAME: &str = "vocotype";
 pub const CONFIG_FILE_NAME: &str = "config.toml";
 
@@ -17,6 +19,7 @@ pub fn default_config_template() -> &'static str {
 model-revision = "asr-models"
 
 [asr]
+backend = "sherpa"
 hotwords-score = 3.0
 
 [post-processing]
@@ -79,6 +82,12 @@ pub fn config_schema() -> &'static str {
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "backend": {
+          "type": "string",
+          "enum": ["sherpa", "iflytek"],
+          "default": "sherpa",
+          "description": "ASR 后端."
+        },
         "hotwords-score": {
           "type": "number",
           "minimum": 0,
@@ -253,6 +262,7 @@ pub struct AppConfig {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AsrConfig {
+    pub backend: Option<AsrBackend>,
     #[serde(alias = "hotwords-score")]
     pub hotwords_score: Option<f32>,
 }

@@ -1,6 +1,6 @@
 # VocoType
 
-VocoType 是一个本地语音转写和文本注入工具. 它使用本地 sherpa-onnx 模型完成语音识别, VAD 分段, 标点恢复, 热键录音, 文本注入和 SRT 字幕输出.
+VocoType 是一个本地语音转写和文本注入工具. 默认使用 sherpa-onnx, 也可以选择纯 Rust 接入的讯飞 EdgeEsr 后端完成语音识别, VAD 分段, 标点恢复, 热键录音, 文本注入和 SRT 字幕输出.
 
 本项目是 [vocotype-cli](https://github.com/233stone/vocotype-cli) 的 Rust 实现版本.
 
@@ -29,6 +29,21 @@ vocotype models download
 
 ```shell
 vocotype models doctor
+```
+
+下载并检查讯飞模型:
+
+```shell
+vocotype models download --backend iflytek
+vocotype models doctor --backend iflytek
+```
+
+讯飞模型不提交到 Git 或 Git LFS, 由当前仓库的独立 `models-iflytek-v1.0.0` Release 提供. 模型包只包含 ONNX 模型和后处理数据, Rust custom-op 直接编译进 `vocotype` 可执行文件.
+
+使用讯飞后端转写:
+
+```shell
+vocotype --asr-backend iflytek transcribe input.wav
 ```
 
 生成可编辑的词汇表模板:
@@ -162,6 +177,13 @@ english-punctuation = true
 strip-trailing-period = true
 ```
 
+选择讯飞后端:
+
+```toml
+[asr]
+backend = "iflytek"
+```
+
 这些选项会在词表改写之后处理最终转写文本, 可把中文标点转换为 ASCII 标点, 也可删除末尾句号.
 
 更多配置示例见 [docs/config.md](docs/config.md).
@@ -172,6 +194,7 @@ strip-trailing-period = true
 vocotype devices
 vocotype models download
 vocotype models doctor
+vocotype models doctor --backend iflytek
 vocotype daemon
 vocotype transcribe input.wav --format srt
 vocotype dict doctor

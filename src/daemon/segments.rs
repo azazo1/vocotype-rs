@@ -15,9 +15,12 @@ pub(super) fn build_segmenter(
     options: &DaemonOptions,
     store: &ModelStore,
 ) -> Result<VadSegmenter> {
-    store.verify_vad_checksum()?;
-    let model_path = store.vad_model_path()?;
-    VadSegmenter::new(
+    if options.asr_options.backend == crate::asr_backend::AsrBackend::Sherpa {
+        store.verify_vad_checksum()?;
+    }
+    let model_path = store.vad_model_path_for(options.asr_options.backend)?;
+    VadSegmenter::new_for_backend(
+        options.asr_options.backend,
         VadConfig {
             end_silence_ms: options.end_silence_ms,
             pre_roll_ms: options.pre_roll_ms,
@@ -69,7 +72,7 @@ pub(super) fn drain_release_tail(
             .min(Duration::from_millis(10));
         match audio_rx.recv_timeout(timeout) {
             Ok(frame) => {
-                for segment in segmenter.push(&frame) {
+                for segment in segmenter.push(&frame)? {
                     submit_segment(segment_tx, state, overlay, segment)?;
                 }
             }
