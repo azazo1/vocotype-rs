@@ -23,7 +23,7 @@ run-daemon *args:
     cargo run -- daemon {{args}}
 
 # 生成 macOS .app bundle, 输出到 target/macos-app/VocoType.app.
-package-macos: build-icon
+macos-app: build-icon
     sh scripts/package-macos-app.sh
 
 # just download-models --model-dir ./models
