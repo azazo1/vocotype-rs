@@ -77,12 +77,6 @@ impl VadSegmenter {
         }
     }
 
-    pub fn active_audio_start_sample(&self) -> Option<usize> {
-        match self {
-            Self::Sherpa(_) => None,
-            Self::Iflytek(segmenter) => segmenter.active_audio_start_sample(),
-        }
-    }
 }
 
 fn map_iflytek_segment(segment: iflytek_runtime::EdgeEsrVadSegment) -> SpeechSegment {

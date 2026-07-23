@@ -83,6 +83,26 @@ impl<'a> EdgeEsrDecoder<'a> {
         Ok(runtime)
     }
 
+    pub(crate) fn reset(&mut self, attention: MemoryTryAttention) -> Result<()> {
+        let decoder1_state = zero_states(self.decoder1)?;
+        self.decoder2_state = zero_states(self.decoder2)?;
+        self.decoder1_state = decoder1_state.clone();
+        self.decoder1_state_out = decoder1_state;
+        self.attention = attention;
+        self.search = OriginalBeamSearch::new(BeamSearchConfig::default())?;
+        self.active_count = 1;
+        self.labels.fill(0);
+        self.lengths.fill(0);
+        self.labels[0] = START_TOKEN_ID;
+        self.lm.fill(0.0);
+        self.query.fill(0.0);
+        self.query_stop.fill(0.0);
+        self.done = false;
+        self.timings = DecoderTimings::default();
+        self.run_decoder1()?;
+        Ok(())
+    }
+
     pub(crate) fn advance(
         &mut self,
         bank: &EncoderBank,

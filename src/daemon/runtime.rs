@@ -4,14 +4,13 @@ use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use tracing::{debug, info, warn};
 
-use crate::asr::TARGET_SAMPLE_RATE;
 use crate::asr_backend::AsrBackend;
 use crate::audio::AudioInput;
 use crate::dataset::DatasetRecorder;
 use crate::hotkey::{HotkeyAction, HotkeyEvent, HotkeyManager, HotkeyMatcher, HotkeyRole};
 use crate::models::ModelStore;
 use crate::overlay::{OverlayHandle, OverlayMode};
-use crate::vad::{SegmentReason, SpeechSegment, VadSegmenter};
+use crate::vad::VadSegmenter;
 
 use super::{DaemonOptions, HotkeyMode};
 use super::segments::{
@@ -145,7 +144,7 @@ pub(super) fn run_daemon_loop(
 
 fn process_audio_frame(
     frame: Vec<i16>,
-    segmenter: &mut VadSegmenter,
+    segmenter: &mut Option<VadSegmenter>,
     task_tx: &Sender<TranscriptionTask>,
     state: &SharedRuntimeState,
     overlay: &OverlayHandle,
@@ -153,58 +152,34 @@ fn process_audio_frame(
 ) -> Result<()> {
     capture.last_frame_at = Instant::now();
     let level = frame_level(&frame);
-    if !capture.stream_active {
-        let mode = if segmenter.detected() {
-            OverlayMode::Recording { level }
-        } else {
-            OverlayMode::Silence {
-                pending: pending_count(state),
-            }
-        };
-        overlay.set(overlay_state(state, mode));
-    }
-
-    let was_detected = segmenter.detected();
-    capture.session_audio.extend_from_slice(&frame);
-    let segments = segmenter.push(&frame)?;
-    let detected = segmenter.detected();
     if capture.streaming_backend {
-        if !was_detected && detected {
-            let start = segmenter
-                .active_audio_start_sample()
-                .unwrap_or_else(|| capture.session_audio.len().saturating_sub(frame.len()))
-                .min(capture.session_audio.len());
-            let started = submit_stream_start(
-                task_tx,
-                state,
-                overlay,
-                capture.session_audio[start..].to_vec(),
-            )?;
-            if started {
-                capture.stream_active = true;
-                capture.stream_start_sample = Some(start);
-            }
-        } else if capture.stream_active {
+        if capture.stream_active {
             submit_stream_audio(task_tx, frame)?;
         }
-        for segment in segments {
-            if capture.stream_active {
-                finish_active_stream(task_tx, capture, segment)?;
-            } else {
-                submit_segment(task_tx, state, overlay, segment)?;
-            }
-        }
+        return Ok(());
+    }
+
+    let segmenter = segmenter
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("sherpa VAD 分段器未初始化"))?;
+    let mode = if segmenter.detected() {
+        OverlayMode::Recording { level }
     } else {
-        for segment in segments {
-            submit_segment(task_tx, state, overlay, segment)?;
+        OverlayMode::Silence {
+            pending: pending_count(state),
         }
+    };
+    overlay.set(overlay_state(state, mode));
+    let segments = segmenter.push(&frame)?;
+    for segment in segments {
+        submit_segment(task_tx, state, overlay, segment)?;
     }
     Ok(())
 }
 
 fn drain_queued_audio_frames(
     audio_rx: &Receiver<Vec<i16>>,
-    segmenter: &mut VadSegmenter,
+    segmenter: &mut Option<VadSegmenter>,
     task_tx: &Sender<TranscriptionTask>,
     state: &SharedRuntimeState,
     overlay: &OverlayHandle,
@@ -226,7 +201,7 @@ fn drain_queued_audio_frames(
 
 struct HotkeyRuntime<'a> {
     capture: &'a mut CaptureRuntime,
-    segmenter: &'a mut VadSegmenter,
+    segmenter: &'a mut Option<VadSegmenter>,
     task_tx: &'a Sender<TranscriptionTask>,
     state: &'a SharedRuntimeState,
     overlay: &'a OverlayHandle,
@@ -240,8 +215,6 @@ struct CaptureRuntime {
     last_frame_at: Instant,
     streaming_backend: bool,
     stream_active: bool,
-    stream_start_sample: Option<usize>,
-    session_audio: Vec<i16>,
 }
 
 impl CaptureRuntime {
@@ -253,8 +226,6 @@ impl CaptureRuntime {
             last_frame_at: Instant::now(),
             streaming_backend,
             stream_active: false,
-            stream_start_sample: None,
-            session_audio: Vec::new(),
         }
     }
 }
@@ -269,7 +240,13 @@ fn handle_hotkey_event(
             HotkeyEvent {
                 role: HotkeyRole::Trigger,
                 action: HotkeyAction::Pressed,
-            } => begin_capture(ctx.capture, ctx.segmenter, ctx.state, ctx.overlay),
+            } => begin_capture(
+                ctx.capture,
+                ctx.segmenter,
+                ctx.task_tx,
+                ctx.state,
+                ctx.overlay,
+            ),
             HotkeyEvent {
                 role: HotkeyRole::Trigger,
                 action: HotkeyAction::Released,
@@ -300,14 +277,26 @@ fn handle_hotkey_event(
             HotkeyEvent {
                 role: HotkeyRole::Trigger,
                 action: HotkeyAction::Pressed,
-            } => begin_capture(ctx.capture, ctx.segmenter, ctx.state, ctx.overlay),
+            } => begin_capture(
+                ctx.capture,
+                ctx.segmenter,
+                ctx.task_tx,
+                ctx.state,
+                ctx.overlay,
+            ),
             _ => Ok(()),
         },
         HotkeyMode::TriggerEnd => match event {
             HotkeyEvent {
                 role: HotkeyRole::Trigger,
                 action: HotkeyAction::Pressed,
-            } => begin_capture(ctx.capture, ctx.segmenter, ctx.state, ctx.overlay),
+            } => begin_capture(
+                ctx.capture,
+                ctx.segmenter,
+                ctx.task_tx,
+                ctx.state,
+                ctx.overlay,
+            ),
             HotkeyEvent {
                 role: HotkeyRole::End,
                 action: HotkeyAction::Pressed,
@@ -327,7 +316,8 @@ fn handle_hotkey_event(
 
 fn begin_capture(
     capture: &mut CaptureRuntime,
-    segmenter: &mut VadSegmenter,
+    segmenter: &mut Option<VadSegmenter>,
+    task_tx: &Sender<TranscriptionTask>,
     state: &SharedRuntimeState,
     overlay: &OverlayHandle,
 ) -> Result<()> {
@@ -338,10 +328,14 @@ fn begin_capture(
     let input = AudioInput::start(None)?;
     capture.audio_rx = Some(input.receiver());
     capture.audio_input = Some(input);
-    segmenter.reset();
-    capture.stream_active = false;
-    capture.stream_start_sample = None;
-    capture.session_audio.clear();
+    if let Some(segmenter) = segmenter {
+        segmenter.reset();
+    }
+    capture.stream_active = if capture.streaming_backend {
+        submit_stream_start(task_tx, state, overlay, Vec::new())?
+    } else {
+        false
+    };
     capture.capturing = true;
     capture.last_frame_at = Instant::now();
     begin_recording_session(state);
@@ -351,7 +345,7 @@ fn begin_capture(
 
 fn end_capture(
     capture: &mut CaptureRuntime,
-    segmenter: &mut VadSegmenter,
+    segmenter: &mut Option<VadSegmenter>,
     task_tx: &Sender<TranscriptionTask>,
     state: &SharedRuntimeState,
     overlay: &OverlayHandle,
@@ -379,19 +373,15 @@ fn end_capture(
             }
         }
     }
-    for segment in segmenter.finish()? {
-        if capture.streaming_backend && capture.stream_active {
-            finish_active_stream(task_tx, capture, segment)?;
-        } else {
+    if capture.streaming_backend {
+        if capture.stream_active {
+            submit_stream_finish(task_tx)?;
+            capture.stream_active = false;
+        }
+    } else if let Some(segmenter) = segmenter {
+        for segment in segmenter.finish()? {
             submit_segment(task_tx, state, overlay, segment)?;
         }
-    }
-    if capture.streaming_backend
-        && capture.stream_active
-        && let Some(segment) = fallback_stream_segment(capture)
-    {
-        warn!(samples = segment.samples.len(), "使用当前音频结束未完成的实时流");
-        finish_active_stream(task_tx, capture, segment)?;
     }
     if let Some(input) = capture.audio_input.take() {
         input.stop();
@@ -407,50 +397,14 @@ fn end_capture(
     Ok(())
 }
 
-fn finish_active_stream(
-    task_tx: &Sender<TranscriptionTask>,
-    capture: &mut CaptureRuntime,
-    segment: SpeechSegment,
-) -> Result<()> {
-    submit_stream_finish(task_tx, segment)?;
-    capture.stream_active = false;
-    capture.stream_start_sample = None;
-    Ok(())
-}
-
-fn fallback_stream_segment(capture: &CaptureRuntime) -> Option<SpeechSegment> {
-    let start = capture.stream_start_sample?.min(capture.session_audio.len());
-    let end = capture.session_audio.len();
-    if start == end {
-        return None;
-    }
-    let samples = capture.session_audio[start..end].to_vec();
-    Some(SpeechSegment {
-        speech_ms: ((samples.len() as u64 * 1_000) / TARGET_SAMPLE_RATE as u64) as u32,
-        samples,
-        reason: SegmentReason::Finish,
-        start_sample: start,
-        end_sample: end,
-        audio_start_sample: start,
-        audio_end_sample: end,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn fallback_stream_segment_uses_only_the_active_stream_audio() {
-        let mut capture = CaptureRuntime::new(true);
-        capture.stream_active = true;
-        capture.stream_start_sample = Some(2);
-        capture.session_audio = vec![0, 1, 2, 3, 4, 5];
-
-        let segment = fallback_stream_segment(&capture).unwrap();
-        assert_eq!(segment.samples, vec![2, 3, 4, 5]);
-        assert_eq!(segment.audio_start_sample, 2);
-        assert_eq!(segment.audio_end_sample, 6);
-        assert_eq!(segment.reason, SegmentReason::Finish);
+    fn iflytek_capture_starts_without_an_external_vad_segment() {
+        let capture = CaptureRuntime::new(true);
+        assert!(capture.streaming_backend);
+        assert!(!capture.stream_active);
     }
 }

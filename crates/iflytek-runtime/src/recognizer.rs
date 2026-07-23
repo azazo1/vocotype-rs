@@ -2,6 +2,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 
+use iflytek_core::MemoryTryAttention;
+
 use crate::decoder::EdgeEsrDecoder;
 use crate::encoder::{ENCODER_CHUNK_FRAMES, EdgeEsrEncoder, EncoderChunk};
 
@@ -70,6 +72,16 @@ impl<'a> EdgeEsrRecognizer<'a> {
             finalized: false,
             encoder_elapsed: Duration::ZERO,
         }
+    }
+
+    pub(crate) fn reset(&mut self, attention: MemoryTryAttention) -> Result<()> {
+        self.encoder.reset()?;
+        self.decoder.reset(attention)?;
+        self.bank = EncoderBank::default();
+        self.decoder_calls = 0;
+        self.finalized = false;
+        self.encoder_elapsed = Duration::ZERO;
+        Ok(())
     }
 
     pub(crate) fn prime_encoder(&mut self) -> Result<usize> {

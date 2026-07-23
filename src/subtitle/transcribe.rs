@@ -3,8 +3,9 @@ use std::path::Path;
 use anyhow::Result;
 use tracing::{debug, info};
 
-use crate::asr::{AsrEngine, AsrOptions, TARGET_SAMPLE_RATE};
+use crate::asr::{AsrEngine, AsrOptions, TranscriptionResult, TARGET_SAMPLE_RATE};
 use crate::models::ModelStore;
+use crate::punctuation::strip_trailing_period;
 use crate::vad::{SpeechSegment, VadConfig, VadSegmenter};
 
 use super::srt::{SubtitleCue, render_srt};
@@ -37,49 +38,97 @@ pub fn transcribe_srt(
         store.verify_vad_checksum()?;
     }
     let pcm = crate::wav::read_wav_mono_i16(audio, TARGET_SAMPLE_RATE)?;
-    let engine = AsrEngine::load_with_options(store.clone(), options.asr_options.clone())?;
-    let mut segmenter = VadSegmenter::new_for_backend(
-        options.asr_options.backend,
-        VadConfig::default(),
-        &store.vad_model_path_for(options.asr_options.backend)?,
-    )?;
-    let segments = segment_audio(&mut segmenter, &pcm.samples)?;
-
+    let strip_final_period = options.asr_options.strip_trailing_period;
+    let mut engine_options = options.asr_options.clone();
+    engine_options.strip_trailing_period = false;
+    let engine = AsrEngine::load_with_options(store.clone(), engine_options)?;
     info!(
         audio = %audio.display(),
-        segments = segments.len(),
         duration = format!("{:.2}", pcm.duration_seconds()),
         "开始生成 SRT 字幕"
     );
 
     let mut cues = Vec::new();
-    for segment in segments {
-        let segment_pcm = crate::wav::PcmAudio {
-            sample_rate: TARGET_SAMPLE_RATE,
-            samples: segment.samples.clone(),
-        };
-        let result = engine.transcribe_pcm(&segment_pcm)?;
-        if !result.success || result.text.trim().is_empty() {
-            debug!(
-                start_ms = sample_to_ms(segment.start_sample),
-                end_ms = sample_to_ms(segment.end_sample),
-                "跳过空字幕片段"
+    if options.asr_options.backend == crate::asr_backend::AsrBackend::Iflytek {
+        let mut segment_count = 0usize;
+        engine.transcribe_pcm_streaming(&pcm, |update| {
+            let Some(committed) = update.committed_segment else {
+                return Ok(());
+            };
+            segment_count += 1;
+            let segment = SpeechSegment {
+                samples: committed.samples,
+                reason: committed.reason,
+                speech_ms: committed.speech_ms,
+                start_sample: committed.start_sample,
+                end_sample: committed.end_sample,
+                audio_start_sample: committed.audio_start_sample,
+                audio_end_sample: committed.audio_end_sample,
+            };
+            push_transcribed_segment(
+                &mut cues,
+                &segment,
+                &committed.result,
+                options.max_chars,
             );
-            continue;
+            Ok(())
+        })?;
+        info!(segments = segment_count, "讯飞 VAD 字幕分段完成");
+    } else {
+        let mut segmenter = VadSegmenter::new_for_backend(
+            options.asr_options.backend,
+            VadConfig::default(),
+            &store.vad_model_path_for(options.asr_options.backend)?,
+        )?;
+        let segments = segment_audio(&mut segmenter, &pcm.samples)?;
+        info!(segments = segments.len(), "sherpa VAD 字幕分段完成");
+        for segment in segments {
+            let segment_pcm = crate::wav::PcmAudio {
+                sample_rate: TARGET_SAMPLE_RATE,
+                samples: segment.samples.clone(),
+            };
+            let result = engine.transcribe_pcm(&segment_pcm)?;
+            push_transcribed_segment(&mut cues, &segment, &result, options.max_chars);
         }
-        push_segment_cues(
-            &mut cues,
-            &segment,
-            &result.text,
-            &result.raw_text,
-            &result.tokens,
-            result.token_timestamps.as_deref(),
-            options.max_chars,
-        );
+    }
+
+    if strip_final_period {
+        strip_last_cue_period(&mut cues);
     }
 
     info!(cues = cues.len(), "SRT 字幕生成完成");
     Ok(render_srt(&cues))
+}
+
+fn push_transcribed_segment(
+    cues: &mut Vec<SubtitleCue>,
+    segment: &SpeechSegment,
+    result: &TranscriptionResult,
+    max_chars: usize,
+) {
+    if !result.success || result.text.trim().is_empty() {
+        debug!(
+            start_ms = sample_to_ms(segment.start_sample),
+            end_ms = sample_to_ms(segment.end_sample),
+            "跳过空字幕片段"
+        );
+        return;
+    }
+    push_segment_cues(
+        cues,
+        segment,
+        &result.text,
+        &result.raw_text,
+        &result.tokens,
+        result.token_timestamps.as_deref(),
+        max_chars,
+    );
+}
+
+fn strip_last_cue_period(cues: &mut [SubtitleCue]) {
+    if let Some(last) = cues.last_mut() {
+        last.text = strip_trailing_period(&last.text);
+    }
 }
 
 fn segment_audio(segmenter: &mut VadSegmenter, samples: &[i16]) -> Result<Vec<SpeechSegment>> {
@@ -212,6 +261,27 @@ fn seconds_to_ms(seconds: f32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stripping_the_document_period_preserves_intermediate_boundaries() {
+        let mut cues = vec![
+            SubtitleCue {
+                start_ms: 0,
+                end_ms: 1_000,
+                text: "first.".to_string(),
+            },
+            SubtitleCue {
+                start_ms: 1_000,
+                end_ms: 2_000,
+                text: "second.".to_string(),
+            },
+        ];
+
+        strip_last_cue_period(&mut cues);
+
+        assert_eq!(cues[0].text, "first.");
+        assert_eq!(cues[1].text, "second");
+    }
 
     #[test]
     fn splits_segment_time_by_text_length() {

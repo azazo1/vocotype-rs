@@ -360,12 +360,22 @@ pub async fn run() -> Result<()> {
             .post_processing
             .strip_trailing_period
             .unwrap_or(false),
+        iflytek_vad: iflytek_runtime::EdgeEsrVadConfig::default(),
     };
 
     match cli.command {
         Command::Daemon(args) => {
             let mut asr_options = asr_options;
             asr_options.strip_trailing_period = args.strip_trailing_period;
+            asr_options.iflytek_vad = iflytek_runtime::EdgeEsrVadConfig {
+                sample_rate: crate::asr::TARGET_SAMPLE_RATE,
+                pre_roll_ms: args.pre_roll_ms,
+                tail_padding_ms: args.tail_padding_ms,
+                end_silence_ms: args.end_silence_ms,
+                min_speech_ms: args.min_speech_ms,
+                max_segment_ms: args.max_segment_ms,
+                ..iflytek_runtime::EdgeEsrVadConfig::default()
+            };
             let daemon = DaemonOptions {
                 hotkey: args.hotkey,
                 hotkey_mode: HotkeyMode::parse(&args.hotkey_mode)?,

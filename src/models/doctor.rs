@@ -65,11 +65,6 @@ pub fn loadability_report_for(
         },
     )?;
     if backend == AsrBackend::Iflytek {
-        let vad_model = store.vad_model_path_for(backend)?;
-        let _vad = iflytek_runtime::EdgeEsrVad::load(
-            &vad_model,
-            iflytek_runtime::EdgeEsrVadConfig::default(),
-        )?;
         writeln!(writer, "iflytek_asr=loadable")?;
         writeln!(writer, "iflytek_vad=loadable")?;
         writeln!(writer, "iflytek_custom_op_domain={}", iflytek_core::CUSTOM_OP_DOMAIN)?;

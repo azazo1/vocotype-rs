@@ -18,7 +18,6 @@ use crate::postprocess_types::{ProcessedWord, RenderedWord, WordKind};
 #[derive(Clone, Debug, Default)]
 pub struct PostprocessOptions {
     pub english_punctuation: bool,
-    pub strip_trailing_period: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -394,11 +393,6 @@ fn apply_output_options(mut text: String, options: &PostprocessOptions) -> Strin
             .replace('\u{ff1a}', ":")
             .replace('\u{ff1b}', ";")
             .replace('\u{3001}', ",");
-    }
-    if options.strip_trailing_period {
-        while text.ends_with('.') || text.ends_with('\u{3002}') {
-            text.pop();
-        }
     }
     text
 }

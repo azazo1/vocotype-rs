@@ -34,13 +34,13 @@ pub(super) enum TranscriptionTask {
     Segment(SpeechSegment),
     StreamStart(Vec<i16>),
     StreamAudio(Vec<i16>),
-    StreamFinish(SpeechSegment),
+    StreamFinish,
 }
 
 struct LiveStreamInput<'a> {
     task_rx: &'a Receiver<TranscriptionTask>,
     initial: Option<Vec<i16>>,
-    final_segment: Option<SpeechSegment>,
+    finished: bool,
 }
 
 impl<'a> LiveStreamInput<'a> {
@@ -48,7 +48,7 @@ impl<'a> LiveStreamInput<'a> {
         Self {
             task_rx,
             initial: Some(initial),
-            final_segment: None,
+            finished: false,
         }
     }
 
@@ -62,8 +62,8 @@ impl<'a> LiveStreamInput<'a> {
                 buffer.extend(samples);
                 Ok(true)
             }
-            Ok(TranscriptionTask::StreamFinish(segment)) => {
-                self.final_segment = Some(segment);
+            Ok(TranscriptionTask::StreamFinish) => {
+                self.finished = true;
                 Ok(false)
             }
             Ok(TranscriptionTask::Segment(_)) | Ok(TranscriptionTask::StreamStart(_)) => {
@@ -73,10 +73,8 @@ impl<'a> LiveStreamInput<'a> {
         }
     }
 
-    fn finish(mut self) -> Option<SpeechSegment> {
-        self.final_segment
-            .take()
-            .or_else(|| drain_stream_finish(self.task_rx))
+    fn finish(self) -> bool {
+        self.finished || drain_stream_finish(self.task_rx)
     }
 }
 
@@ -96,6 +94,16 @@ impl<'a> StreamingOutput<'a> {
     }
 
     fn handle(&mut self, update: TranscriptionUpdate) -> Result<(), anyhow::Error> {
+        if let Some(segment) = &update.committed_segment
+            && let Some(dataset) = &self.config.dataset
+            && let Err(error) = dataset.record(
+                &segment.result,
+                TARGET_SAMPLE_RATE,
+                &segment.samples,
+            )
+        {
+            warn!(%error, "数据集记录失败");
+        }
         let presentation = self.tracker.update(&update);
         self.config.overlay.set(streaming_overlay_state(
             &self.config.state,
@@ -165,7 +173,7 @@ pub(super) fn transcription_worker(
                 continue;
             }
         };
-        let (segment, transcribed, streaming, stream_injection_error) = match task {
+        let (transcribed, streaming, stream_injection_error, dataset_audio) = match task {
             TranscriptionTask::Segment(segment) => {
                 let pcm = crate::wav::PcmAudio {
                     sample_rate: TARGET_SAMPLE_RATE,
@@ -175,10 +183,20 @@ pub(super) fn transcription_worker(
                     let mut output = StreamingOutput::new(&config);
                     let transcribed = engine
                         .transcribe_pcm_streaming(&pcm, |update| output.handle(update));
-                    (segment, transcribed, true, output.final_error())
+                    (
+                        transcribed,
+                        true,
+                        output.final_error(),
+                        Some((segment.samples, segment.speech_ms)),
+                    )
                 } else {
                     let transcribed = engine.transcribe_pcm(&pcm);
-                    (segment, transcribed, false, None)
+                    (
+                        transcribed,
+                        false,
+                        None,
+                        Some((segment.samples, segment.speech_ms)),
+                    )
                 }
             }
             TranscriptionTask::StreamStart(initial) => {
@@ -197,21 +215,24 @@ pub(super) fn transcription_worker(
                     |buffer| input.read(buffer),
                     |update| output.handle(update),
                 );
-                let Some(segment) = input.finish() else {
+                if !input.finish() {
                     handle_worker_error(
                         &config.overlay,
                         &config.state,
                         "实时流式输入没有结束语音段".to_string(),
                     );
                     continue;
-                };
-                (segment, transcribed, true, output.final_error())
+                }
+                (transcribed, true, output.final_error(), None)
             }
-            TranscriptionTask::StreamAudio(_) | TranscriptionTask::StreamFinish(_) => {
+            TranscriptionTask::StreamAudio(_) | TranscriptionTask::StreamFinish => {
                 warn!("收到没有开始事件的实时流式任务");
                 continue;
             }
         };
+        let fallback_duration = dataset_audio
+            .as_ref()
+            .map_or(0.0, |(_, speech_ms)| *speech_ms as f32 / 1_000.0);
         let result = match transcribed {
             Ok(result) => result,
             Err(error) => TranscriptionResult {
@@ -220,15 +241,16 @@ pub(super) fn transcription_worker(
                 raw_text: String::new(),
                 tokens: Vec::new(),
                 token_timestamps: None,
-                duration: segment.speech_ms as f32 / 1_000.0,
+                duration: fallback_duration,
                 inference_latency: 0.0,
                 confidence: 0.0,
                 error: Some(error.to_string()),
             },
         };
 
-        if let Some(dataset) = &config.dataset
-            && let Err(error) = dataset.record(&result, TARGET_SAMPLE_RATE, &segment.samples)
+        if let Some((samples, _)) = &dataset_audio
+            && let Some(dataset) = &config.dataset
+            && let Err(error) = dataset.record(&result, TARGET_SAMPLE_RATE, samples)
         {
             warn!(%error, "数据集记录失败");
         }
@@ -316,12 +338,15 @@ fn recv_task(
     }
 }
 
-fn drain_stream_finish(task_rx: &Receiver<TranscriptionTask>) -> Option<SpeechSegment> {
+fn drain_stream_finish(task_rx: &Receiver<TranscriptionTask>) -> bool {
     loop {
-        match task_rx.recv().ok()? {
-            TranscriptionTask::StreamFinish(segment) => return Some(segment),
-            TranscriptionTask::StreamAudio(_) => {}
-            TranscriptionTask::Segment(_) | TranscriptionTask::StreamStart(_) => return None,
+        match task_rx.recv() {
+            Ok(TranscriptionTask::StreamFinish) => return true,
+            Ok(TranscriptionTask::StreamAudio(_)) => {}
+            Ok(TranscriptionTask::Segment(_)) | Ok(TranscriptionTask::StreamStart(_)) => {
+                return false;
+            }
+            Err(_) => return false,
         }
     }
 }
@@ -391,6 +416,8 @@ mod tests {
                 confidence: 1.0,
                 error: None,
             },
+            committed_prefix_chars: 0,
+            committed_segment: None,
             revision: false,
             revision_count: 0,
             sequence: 1,
@@ -417,7 +444,7 @@ mod tests {
     fn live_stream_input_keeps_consecutive_streams_separate() {
         let (tx, rx) = crossbeam_channel::unbounded();
         tx.send(TranscriptionTask::StreamAudio(vec![2])).unwrap();
-        tx.send(TranscriptionTask::StreamFinish(segment(3))).unwrap();
+        tx.send(TranscriptionTask::StreamFinish).unwrap();
         tx.send(TranscriptionTask::StreamStart(vec![4])).unwrap();
 
         let mut input = LiveStreamInput::new(&rx, vec![1]);
@@ -426,7 +453,7 @@ mod tests {
         assert!(input.read(&mut buffer).unwrap());
         assert!(!input.read(&mut buffer).unwrap());
         assert_eq!(buffer, vec![1, 2]);
-        assert_eq!(input.finish().unwrap().samples, vec![3]);
+        assert!(input.finish());
         assert!(matches!(
             rx.recv().unwrap(),
             TranscriptionTask::StreamStart(samples) if samples == vec![4]
@@ -437,10 +464,10 @@ mod tests {
     fn drain_stream_finish_stops_before_the_next_task() {
         let (tx, rx) = crossbeam_channel::unbounded();
         tx.send(TranscriptionTask::StreamAudio(vec![1])).unwrap();
-        tx.send(TranscriptionTask::StreamFinish(segment(2))).unwrap();
+        tx.send(TranscriptionTask::StreamFinish).unwrap();
         tx.send(TranscriptionTask::Segment(segment(3))).unwrap();
 
-        assert_eq!(drain_stream_finish(&rx).unwrap().samples, vec![2]);
+        assert!(drain_stream_finish(&rx));
         assert!(matches!(
             rx.recv().unwrap(),
             TranscriptionTask::Segment(segment) if segment.samples == vec![3]

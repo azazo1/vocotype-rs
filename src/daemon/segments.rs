@@ -13,10 +13,11 @@ use super::worker::TranscriptionTask;
 pub(super) fn build_segmenter(
     options: &DaemonOptions,
     store: &ModelStore,
-) -> Result<VadSegmenter> {
-    if options.asr_options.backend == crate::asr_backend::AsrBackend::Sherpa {
-        store.verify_vad_checksum()?;
+) -> Result<Option<VadSegmenter>> {
+    if options.asr_options.backend == crate::asr_backend::AsrBackend::Iflytek {
+        return Ok(None);
     }
+    store.verify_vad_checksum()?;
     let model_path = store.vad_model_path_for(options.asr_options.backend)?;
     VadSegmenter::new_for_backend(
         options.asr_options.backend,
@@ -30,6 +31,7 @@ pub(super) fn build_segmenter(
         },
         &model_path,
     )
+    .map(Some)
 }
 
 pub(super) fn submit_segment(
@@ -62,9 +64,6 @@ pub(super) fn submit_stream_start(
     overlay: &OverlayHandle,
     samples: Vec<i16>,
 ) -> Result<bool> {
-    if samples.is_empty() {
-        return Ok(false);
-    }
     let pending = increment_queue(state)?;
     overlay.set(overlay_state(state, OverlayMode::Transcribing { pending }));
     task_tx
@@ -84,10 +83,9 @@ pub(super) fn submit_stream_audio(
 
 pub(super) fn submit_stream_finish(
     task_tx: &Sender<TranscriptionTask>,
-    segment: SpeechSegment,
 ) -> Result<()> {
     task_tx
-        .send(TranscriptionTask::StreamFinish(segment))
+        .send(TranscriptionTask::StreamFinish)
         .map_err(|error| anyhow!("无法结束实时流式转写: {}", error))
 }
 

@@ -60,6 +60,18 @@ pub struct EdgeEsrVadSegment {
     pub audio_end_sample: usize,
 }
 
+#[derive(Clone, Debug)]
+pub enum EdgeEsrVadEvent {
+    SpeechStart {
+        audio_start_sample: usize,
+    },
+    AudioReady {
+        audio_end_sample: usize,
+        force: bool,
+    },
+    SpeechEnd(EdgeEsrVadSegment),
+}
+
 struct NeuralState {
     cell: Vec<f32>,
     projection: Vec<f32>,
@@ -145,6 +157,17 @@ impl EdgeEsrVad {
     }
 
     pub fn push(&mut self, samples: &[i16]) -> Result<Vec<EdgeEsrVadSegment>> {
+        Ok(self
+            .push_events(samples)?
+            .into_iter()
+            .filter_map(|event| match event {
+                EdgeEsrVadEvent::SpeechEnd(segment) => Some(segment),
+                EdgeEsrVadEvent::SpeechStart { .. } | EdgeEsrVadEvent::AudioReady { .. } => None,
+            })
+            .collect())
+    }
+
+    pub fn push_events(&mut self, samples: &[i16]) -> Result<Vec<EdgeEsrVadEvent>> {
         if samples.is_empty() {
             return Ok(Vec::new());
         }
@@ -154,6 +177,17 @@ impl EdgeEsrVad {
     }
 
     pub fn finish(&mut self) -> Result<Vec<EdgeEsrVadSegment>> {
+        Ok(self
+            .finish_events()?
+            .into_iter()
+            .filter_map(|event| match event {
+                EdgeEsrVadEvent::SpeechEnd(segment) => Some(segment),
+                EdgeEsrVadEvent::SpeechStart { .. } | EdgeEsrVadEvent::AudioReady { .. } => None,
+            })
+            .collect())
+    }
+
+    pub fn finish_events(&mut self) -> Result<Vec<EdgeEsrVadEvent>> {
         let started = *self.stream_started.get_or_insert_with(Instant::now);
         let mut output = self.process_available_frames()?;
         let rounded_frames = self.feature_frames.div_ceil(STACKED_FRAMES) * STACKED_FRAMES;
@@ -174,26 +208,35 @@ impl EdgeEsrVad {
             for _ in 0..missing {
                 let evidence = self.endpoint.pad_silence();
                 let status = self.endpoint.step(evidence.frame, rounded_frames as i32)?;
-                if let Some(segment) = self.record_status(status, true) {
-                    output.push(segment);
-                }
+                output.extend(self.record_events(status, evidence.frame, true));
                 self.endpoint.state_mut().current_frame = evidence.frame + 1;
                 self.endpoint.state_mut().read_delay = 0;
             }
         }
         let status = self.endpoint.finalize(self.endpoint.state().current_frame);
-        if status == VadStatus::SpeechEnd
-            && let Some(segment) = self.record_status(status, true)
-        {
-            output.push(segment);
+        if status == VadStatus::SpeechEnd {
+            output.push(EdgeEsrVadEvent::AudioReady {
+                audio_end_sample: self.samples.len(),
+                force: true,
+            });
+            self.endpoint.state_mut().read_delay = 0;
+            output.extend(self.record_events(
+                status,
+                self.endpoint.state().current_frame,
+                true,
+            ));
         }
+        let segment_count = output
+            .iter()
+            .filter(|event| matches!(event, EdgeEsrVadEvent::SpeechEnd(_)))
+            .count();
         info!(
             elapsed_ms = started.elapsed().as_millis(),
             frontend_ms = self.frontend_elapsed.as_millis(),
             onnx_ms = self.onnx_elapsed.as_millis(),
             feature_frames = self.feature_frames,
             inference_groups = self.inference_groups,
-            segment_count = output.len(),
+            segment_count,
             "EdgeEsr VAD completed"
         );
         Ok(output)
@@ -247,7 +290,7 @@ impl EdgeEsrVad {
         Ok(())
     }
 
-    fn process_available_frames(&mut self) -> Result<Vec<EdgeEsrVadSegment>> {
+    fn process_available_frames(&mut self) -> Result<Vec<EdgeEsrVadEvent>> {
         let mut output = Vec::new();
         while self.samples.len().saturating_sub(self.feature_cursor) >= FRAME_LENGTH {
             let frame = &self.samples[self.feature_cursor..self.feature_cursor + FRAME_LENGTH];
@@ -271,7 +314,7 @@ impl EdgeEsrVad {
         &mut self,
         frames: Vec<usize>,
         flush_frame: i32,
-    ) -> Result<Vec<EdgeEsrVadSegment>> {
+    ) -> Result<Vec<EdgeEsrVadEvent>> {
         let features = if self.feature_group.is_empty() {
             vec![0_i16; VAD_INPUT_SIZE]
         } else {
@@ -327,13 +370,37 @@ impl EdgeEsrVad {
                 energy,
             );
             let status = self.endpoint.step(evidence.frame, flush_frame)?;
-            if let Some(segment) = self.record_status(status, flush_frame >= 0) {
-                output.push(segment);
-            }
+            output.extend(self.record_events(status, evidence.frame, flush_frame >= 0));
             self.endpoint.state_mut().current_frame = evidence.frame + 1;
             self.endpoint.state_mut().read_delay = 0;
         }
         Ok(output)
+    }
+
+    fn record_events(
+        &mut self,
+        status: VadStatus,
+        frame: i32,
+        final_flush: bool,
+    ) -> Vec<EdgeEsrVadEvent> {
+        let read_delay = self.endpoint.state().read_delay;
+        let mut output = Vec::new();
+        let segment = self.record_status(status, final_flush);
+        if status == VadStatus::SpeechStart
+            && let Some(audio_start_sample) = self.active_audio_start_sample()
+        {
+            output.push(EdgeEsrVadEvent::SpeechStart { audio_start_sample });
+        }
+        if read_delay > 0 {
+            output.push(EdgeEsrVadEvent::AudioReady {
+                audio_end_sample: (frame.max(0) as usize + 1) * SAMPLES_PER_FRAME,
+                force: status == VadStatus::SpeechEnd,
+            });
+        }
+        if let Some(segment) = segment {
+            output.push(EdgeEsrVadEvent::SpeechEnd(segment));
+        }
+        output
     }
 
     fn record_status(

@@ -15,6 +15,7 @@ use crate::asr_backend::AsrBackend;
 use crate::dict::{DEFAULT_HOTWORDS_SCORE, SpeechDictionary};
 use crate::models::{AsrModelFiles, ModelStore, PuncModelFiles};
 use crate::punctuation::{convert_to_english_punctuation, strip_trailing_period};
+use crate::vad::SegmentReason;
 use crate::wav::PcmAudio;
 
 pub const TARGET_SAMPLE_RATE: u32 = 16_000;
@@ -36,10 +37,24 @@ pub struct TranscriptionResult {
 #[derive(Clone, Debug)]
 pub struct TranscriptionUpdate {
     pub result: TranscriptionResult,
+    pub committed_prefix_chars: usize,
+    pub committed_segment: Option<CommittedTranscriptionSegment>,
     pub revision: bool,
     pub revision_count: usize,
     pub sequence: usize,
     pub final_result: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct CommittedTranscriptionSegment {
+    pub result: TranscriptionResult,
+    pub samples: Vec<i16>,
+    pub reason: SegmentReason,
+    pub speech_ms: u32,
+    pub start_sample: usize,
+    pub end_sample: usize,
+    pub audio_start_sample: usize,
+    pub audio_end_sample: usize,
 }
 
 impl TranscriptionResult {
@@ -72,6 +87,7 @@ pub struct AsrOptions {
     pub hotwords_score: f32,
     pub english_punctuation: bool,
     pub strip_trailing_period: bool,
+    pub iflytek_vad: iflytek_runtime::EdgeEsrVadConfig,
 }
 
 impl Default for AsrOptions {
@@ -82,6 +98,7 @@ impl Default for AsrOptions {
             hotwords_score: DEFAULT_HOTWORDS_SCORE,
             english_punctuation: false,
             strip_trailing_period: false,
+            iflytek_vad: iflytek_runtime::EdgeEsrVadConfig::default(),
         }
     }
 }
@@ -121,8 +138,8 @@ impl AsrEngine {
                     iflytek_runtime::EdgeEsrRuntimeOptions {
                         postprocess: iflytek_core::PostprocessOptions {
                             english_punctuation: options.english_punctuation,
-                            strip_trailing_period: options.strip_trailing_period,
                         },
+                        vad: options.iflytek_vad.clone(),
                         ..iflytek_runtime::EdgeEsrRuntimeOptions::default()
                     },
                 )?;
@@ -195,6 +212,8 @@ impl AsrEngine {
                 );
                 emit(TranscriptionUpdate {
                     result: result.clone(),
+                    committed_prefix_chars: result.text.chars().count(),
+                    committed_segment: None,
                     revision: false,
                     revision_count: 0,
                     sequence: 1,
@@ -207,7 +226,7 @@ impl AsrEngine {
                 let mut final_result = None;
                 let mut last_text = String::new();
                 let mut revision_count = 0;
-                runtime.transcribe_streaming_pcm(
+                runtime.transcribe_vad_streaming_pcm(
                     TARGET_SAMPLE_RATE,
                     |buffer| {
                         if cursor >= samples_i16.len() {
@@ -220,6 +239,35 @@ impl AsrEngine {
                         Ok(cursor < samples_i16.len())
                     },
                     |update| {
+                        let committed_segment = update.committed_segment.map(|segment| {
+                            let result = self.build_result(
+                                segment.speech_ms as f32 / 1_000.0,
+                                start.elapsed().as_secs_f32(),
+                                DecodedResult {
+                                    raw_text: segment.transcription.text.trim().to_string(),
+                                    tokens: segment.transcription.tokens,
+                                    token_timestamps: segment.transcription.token_timestamps,
+                                    confidence: segment.transcription.confidence,
+                                },
+                                false,
+                            );
+                            CommittedTranscriptionSegment {
+                                result,
+                                samples: segment.samples,
+                                reason: map_iflytek_segment_reason(segment.reason),
+                                speech_ms: segment.speech_ms,
+                                start_sample: segment.start_sample,
+                                end_sample: segment.end_sample,
+                                audio_start_sample: segment.audio_start_sample,
+                                audio_end_sample: segment.audio_end_sample,
+                            }
+                        });
+                        let raw_committed_prefix = update
+                            .transcription
+                            .text
+                            .chars()
+                            .take(update.committed_prefix_chars)
+                            .collect::<String>();
                         let result = self.build_result(
                             audio.duration_seconds(),
                             start.elapsed().as_secs_f32(),
@@ -243,6 +291,11 @@ impl AsrEngine {
                             final_result = Some(result.clone());
                         }
                         emit(TranscriptionUpdate {
+                            committed_prefix_chars: self
+                                .postprocess_text(&raw_committed_prefix, false)
+                                .chars()
+                                .count(),
+                            committed_segment,
                             result,
                             revision,
                             revision_count,
@@ -274,7 +327,7 @@ impl AsrEngine {
         let mut final_result = None;
         let mut last_text = String::new();
         let mut revision_count = 0;
-        runtime.transcribe_streaming_pcm(
+        runtime.transcribe_vad_streaming_pcm(
             TARGET_SAMPLE_RATE,
             |buffer| {
                 let previous_len = buffer.len();
@@ -286,6 +339,38 @@ impl AsrEngine {
                 Ok(has_more)
             },
             |update| {
+                let committed_segment = update.committed_segment.map(|segment| {
+                    let result = self.build_result(
+                        segment.speech_ms as f32 / 1_000.0,
+                        start
+                            .elapsed()
+                            .saturating_sub(read_elapsed.get())
+                            .as_secs_f32(),
+                        DecodedResult {
+                            raw_text: segment.transcription.text.trim().to_string(),
+                            tokens: segment.transcription.tokens,
+                            token_timestamps: segment.transcription.token_timestamps,
+                            confidence: segment.transcription.confidence,
+                        },
+                        false,
+                    );
+                    CommittedTranscriptionSegment {
+                        result,
+                        samples: segment.samples,
+                        reason: map_iflytek_segment_reason(segment.reason),
+                        speech_ms: segment.speech_ms,
+                        start_sample: segment.start_sample,
+                        end_sample: segment.end_sample,
+                        audio_start_sample: segment.audio_start_sample,
+                        audio_end_sample: segment.audio_end_sample,
+                    }
+                });
+                let raw_committed_prefix = update
+                    .transcription
+                    .text
+                    .chars()
+                    .take(update.committed_prefix_chars)
+                    .collect::<String>();
                 let duration = input_samples.get() as f32 / TARGET_SAMPLE_RATE as f32;
                 let latency = start
                     .elapsed()
@@ -314,6 +399,11 @@ impl AsrEngine {
                     final_result = Some(result.clone());
                 }
                 emit(TranscriptionUpdate {
+                    committed_prefix_chars: self
+                        .postprocess_text(&raw_committed_prefix, false)
+                        .chars()
+                        .count(),
+                    committed_segment,
                     result,
                     revision,
                     revision_count,
@@ -337,16 +427,7 @@ impl AsrEngine {
         let token_timestamps = decoded.token_timestamps;
         let success = !raw_text.is_empty();
         let text = if success {
-            let punctuated = self.restore_punctuation(&raw_text);
-            let mut rewritten = self.dictionary.rewrite_text(&punctuated);
-            if self.english_punctuation {
-                rewritten = convert_to_english_punctuation(&rewritten).unwrap_or(rewritten);
-            }
-            if self.strip_trailing_period {
-                strip_trailing_period(&rewritten)
-            } else {
-                rewritten
-            }
+            self.postprocess_text(&raw_text, log_final)
         } else {
             raw_text.clone()
         };
@@ -401,6 +482,19 @@ impl AsrEngine {
             BackendEngine::Iflytek(_) => text.to_string(),
         }
     }
+
+    fn postprocess_text(&self, text: &str, session_final: bool) -> String {
+        let punctuated = self.restore_punctuation(text);
+        let mut rewritten = self.dictionary.rewrite_text(&punctuated);
+        if self.english_punctuation {
+            rewritten = convert_to_english_punctuation(&rewritten).unwrap_or(rewritten);
+        }
+        if session_final && self.strip_trailing_period {
+            strip_trailing_period(&rewritten)
+        } else {
+            rewritten
+        }
+    }
 }
 
 struct DecodedResult {
@@ -408,6 +502,16 @@ struct DecodedResult {
     tokens: Vec<String>,
     token_timestamps: Option<Vec<f32>>,
     confidence: f32,
+}
+
+fn map_iflytek_segment_reason(
+    reason: iflytek_runtime::EdgeEsrVadSegmentReason,
+) -> SegmentReason {
+    match reason {
+        iflytek_runtime::EdgeEsrVadSegmentReason::EndSilence => SegmentReason::EndSilence,
+        iflytek_runtime::EdgeEsrVadSegmentReason::MaxDuration => SegmentReason::MaxDuration,
+        iflytek_runtime::EdgeEsrVadSegmentReason::Finish => SegmentReason::Finish,
+    }
 }
 
 fn create_recognizer(files: &AsrModelFiles, hotwords_score: f32) -> Result<OfflineRecognizer> {
@@ -466,5 +570,118 @@ mod tests {
         assert_eq!(samples[0], 0.0);
         assert!((samples[1] - 1.0).abs() < 0.0001);
         assert!(samples[2] <= -1.0);
+    }
+
+    #[test]
+    #[ignore = "需要真实讯飞模型和 16 kHz WAV"]
+    fn real_iflytek_vad_stream_emits_one_session_final() {
+        let model_dir = std::env::var("VOCOTYPE_IFLYTEK_TEST_MODEL_DIR").unwrap();
+        let audio_path = std::env::var("VOCOTYPE_IFLYTEK_TEST_AUDIO").unwrap();
+        let audio = crate::wav::read_wav_mono_i16(
+            Path::new(&audio_path),
+            TARGET_SAMPLE_RATE,
+        )
+        .unwrap();
+        let load_started = Instant::now();
+        let runtime = iflytek_runtime::EdgeEsrRuntime::load(
+            iflytek_runtime::EdgeEsrModelFiles::from_dir(model_dir).unwrap(),
+            iflytek_runtime::EdgeEsrRuntimeOptions::default(),
+        )
+        .unwrap();
+        assert!(load_started.elapsed() < Duration::from_secs(3));
+
+        let mut samples = audio.samples.clone();
+        samples.extend(std::iter::repeat_n(0, TARGET_SAMPLE_RATE as usize * 4));
+        samples.extend_from_slice(&audio.samples);
+        let (result, committed_segments, final_count, first_partial_elapsed) =
+            run_real_iflytek_stream(&runtime, &samples);
+
+        assert!(!result.text.is_empty());
+        assert_eq!(final_count, 1);
+        assert_eq!(committed_segments.len(), 2);
+        assert!(first_partial_elapsed < Duration::from_secs(1));
+        assert_eq!(
+            result.text,
+            committed_segments
+                .iter()
+                .map(|segment| segment.transcription.text.as_str())
+                .collect::<String>()
+        );
+        assert_eq!(
+            committed_segments[0].samples.len(),
+            committed_segments[0]
+                .audio_end_sample
+                .saturating_sub(committed_segments[0].audio_start_sample)
+        );
+        assert!(matches!(
+            committed_segments[0].transcription.text.chars().next_back(),
+            Some('\u{ff0c}' | '\u{3002}' | '\u{ff01}' | '\u{ff1f}' | ',' | '.' | '!' | '?')
+        ));
+
+        let speech_end = committed_segments[0]
+            .end_sample
+            .clamp(1, audio.samples.len());
+        let speech = &audio.samples[..speech_end];
+        let mut short_pause_samples = speech.to_vec();
+        short_pause_samples.extend(std::iter::repeat_n(
+            0,
+            TARGET_SAMPLE_RATE as usize / 5,
+        ));
+        short_pause_samples.extend_from_slice(speech);
+        let (_, short_pause_segments, short_pause_final_count, _) =
+            run_real_iflytek_stream(&runtime, &short_pause_samples);
+
+        assert_eq!(short_pause_final_count, 1);
+        assert_eq!(short_pause_segments.len(), 1);
+    }
+
+    fn run_real_iflytek_stream(
+        runtime: &iflytek_runtime::EdgeEsrRuntime,
+        samples: &[i16],
+    ) -> (
+        iflytek_runtime::EdgeEsrTranscription,
+        Vec<iflytek_runtime::EdgeEsrCommittedSegment>,
+        usize,
+        Duration,
+    ) {
+        let mut cursor = 0;
+        let mut final_count = 0;
+        let mut committed_segments = Vec::new();
+        let started = Instant::now();
+        let mut first_partial_elapsed = None;
+        let result = runtime
+            .transcribe_vad_streaming_pcm(
+                TARGET_SAMPLE_RATE,
+                |buffer| {
+                    if cursor >= samples.len() {
+                        return Ok(false);
+                    }
+                    let end = (cursor + TARGET_SAMPLE_RATE as usize / 25)
+                        .min(samples.len());
+                    buffer.extend_from_slice(&samples[cursor..end]);
+                    cursor = end;
+                    Ok(cursor < samples.len())
+                },
+                |update| {
+                    final_count += usize::from(update.final_result);
+                    if first_partial_elapsed.is_none()
+                        && !update.final_result
+                        && !update.transcription.text.is_empty()
+                    {
+                        first_partial_elapsed = Some(started.elapsed());
+                    }
+                    if let Some(segment) = update.committed_segment {
+                        committed_segments.push(segment);
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+        (
+            result,
+            committed_segments,
+            final_count,
+            first_partial_elapsed.unwrap(),
+        )
     }
 }

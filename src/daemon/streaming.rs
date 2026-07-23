@@ -35,6 +35,10 @@ impl StablePrefixTracker {
         }
 
         let current = &update.result.text;
+        let committed = current
+            .chars()
+            .take(update.committed_prefix_chars)
+            .collect::<String>();
         if update.revision || update.revision_count > self.revision_count {
             self.history.clear();
         }
@@ -49,7 +53,7 @@ impl StablePrefixTracker {
         }
 
         if self.history.len() < STABILITY_HISTORY {
-            return self.presentation(current, String::new(), update.revision);
+            return self.presentation(current, committed, update.revision);
         }
 
         let common_tokens = common_token_prefix(&self.history);
@@ -64,7 +68,12 @@ impl StablePrefixTracker {
         let text_prefix_chars = common_text_prefix_chars(&self.history);
         let candidate_chars = token_prefix.chars().count().min(text_prefix_chars);
         let candidate = current.chars().take(candidate_chars).collect::<String>();
-        let stable = candidate[..last_stable_boundary(&candidate)].to_string();
+        let inferred = candidate[..last_stable_boundary(&candidate)].to_string();
+        let stable = if inferred.chars().count() >= committed.chars().count() {
+            inferred
+        } else {
+            committed
+        };
         self.presentation(current, stable, update.revision)
     }
 
@@ -179,6 +188,8 @@ mod tests {
                 confidence: 1.0,
                 error: None,
             },
+            committed_prefix_chars: 0,
+            committed_segment: None,
             revision,
             revision_count,
             sequence: 1,
@@ -219,6 +230,18 @@ mod tests {
             let result = tracker.update(&update("这是一个仍会继续校准的长句子", false));
             assert!(result.stable.is_empty());
         }
+    }
+
+    #[test]
+    fn exposes_runtime_committed_prefix_immediately() {
+        let mut tracker = StablePrefixTracker::default();
+        let mut partial = update("stable,changing", false);
+        partial.committed_prefix_chars = "stable,".chars().count();
+
+        let result = tracker.update(&partial);
+
+        assert_eq!(result.stable, "stable,");
+        assert_eq!(result.unstable, "changing");
     }
 
     #[test]

@@ -11,18 +11,20 @@ use iflytek_core::{
 use ndarray::ArrayD;
 use ndarray_npy::NpzReader;
 use ort::session::{Session, builder::SessionBuilder};
-use tracing::{debug, info, trace};
+use tracing::info;
 
 mod decoder;
 mod encoder;
 mod recognizer;
+mod streaming;
 mod tensor;
 mod token_timing;
 mod vad;
 
-use token_timing::TokenTimingEstimator;
-
-pub use vad::{EdgeEsrVad, EdgeEsrVadConfig, EdgeEsrVadSegment, EdgeEsrVadSegmentReason};
+pub use vad::{
+    EdgeEsrVad, EdgeEsrVadConfig, EdgeEsrVadEvent, EdgeEsrVadSegment,
+    EdgeEsrVadSegmentReason,
+};
 
 pub const MODEL_REVISION: &str = "iflytek-edgeesr-v1.0.0";
 pub const MODEL_RELEASE_TAG: &str = "models-iflytek-v1.0.0";
@@ -136,6 +138,8 @@ pub struct EdgeEsrTranscription {
 #[derive(Clone, Debug)]
 pub struct EdgeEsrStreamUpdate {
     pub transcription: EdgeEsrTranscription,
+    pub committed_prefix_chars: usize,
+    pub committed_segment: Option<EdgeEsrCommittedSegment>,
     pub revision: bool,
     pub revision_count: usize,
     pub sequence: usize,
@@ -143,8 +147,21 @@ pub struct EdgeEsrStreamUpdate {
 }
 
 #[derive(Clone, Debug)]
+pub struct EdgeEsrCommittedSegment {
+    pub transcription: EdgeEsrTranscription,
+    pub samples: Vec<i16>,
+    pub reason: EdgeEsrVadSegmentReason,
+    pub speech_ms: u32,
+    pub start_sample: usize,
+    pub end_sample: usize,
+    pub audio_start_sample: usize,
+    pub audio_end_sample: usize,
+}
+
+#[derive(Clone, Debug)]
 pub struct EdgeEsrRuntimeOptions {
     pub postprocess: PostprocessOptions,
+    pub vad: EdgeEsrVadConfig,
     pub intra_threads: usize,
 }
 
@@ -152,6 +169,7 @@ impl Default for EdgeEsrRuntimeOptions {
     fn default() -> Self {
         Self {
             postprocess: PostprocessOptions::default(),
+            vad: EdgeEsrVadConfig::default(),
             intra_threads: default_intra_threads(),
         }
     }
@@ -162,16 +180,7 @@ struct EdgeEsrSessions {
     conformer_encoder: Mutex<Session>,
     decoder_part1: Mutex<Session>,
     decoder_part2: Mutex<Session>,
-}
-
-#[derive(Default)]
-struct StreamEmissionState {
-    last_token_ids: Vec<i32>,
-    last_text: String,
-    partial_count: usize,
-    revision_count: usize,
-    postprocess_elapsed: std::time::Duration,
-    token_timing: TokenTimingEstimator,
+    vad: Mutex<EdgeEsrVad>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -238,6 +247,7 @@ impl EdgeEsrRuntime {
                 &files.decoder_part2,
                 options.intra_threads,
             )?),
+            vad: Mutex::new(EdgeEsrVad::load(&files.vad, options.vad)?),
         });
         let runtime = Arc::new(Self {
             files,
@@ -266,6 +276,31 @@ impl EdgeEsrRuntime {
             .map_err(|_| anyhow::anyhow!("EdgeEsr decoder lock poisoned"))
     }
 
+    fn new_attention(&self) -> Result<MemoryTryAttention> {
+        MemoryTryAttention::new(
+            self.attention_weights.0.clone(),
+            self.attention_weights.1.clone(),
+            MemoryAttentionConfig::default(),
+        )
+    }
+
+    fn new_recognizer<'a>(
+        &self,
+        vgg: &'a mut Session,
+        conformer: &'a mut Session,
+        decoder1: &'a mut Session,
+        decoder2: &'a mut Session,
+    ) -> Result<recognizer::EdgeEsrRecognizer<'a>> {
+        let encoder = encoder::EdgeEsrEncoder::new(vgg, conformer)?;
+        let decoder = decoder::EdgeEsrDecoder::new(
+            decoder1,
+            decoder2,
+            self.new_attention()?,
+            self.active_rows,
+        )?;
+        Ok(recognizer::EdgeEsrRecognizer::new(encoder, decoder))
+    }
+
     pub fn session_input_names(&self) -> Result<Vec<(&'static str, Vec<String>)>> {
         Ok(vec![
             ("vgg_encoder", session_inputs(&self.sessions.vgg_encoder)?),
@@ -290,7 +325,7 @@ impl EdgeEsrRuntime {
         sample_rate: u32,
     ) -> Result<EdgeEsrTranscription> {
         let mut cursor = 0;
-        self.transcribe_streaming_pcm(
+        self.transcribe_vad_streaming_pcm(
             sample_rate,
             |buffer| {
                 if cursor >= samples.len() {
@@ -305,192 +340,30 @@ impl EdgeEsrRuntime {
         )
     }
 
-    pub fn transcribe_streaming_pcm<Read, Emit>(
+    pub fn segment_pcm(
         &self,
+        samples: &[i16],
         sample_rate: u32,
-        mut read: Read,
-        mut emit: Emit,
-    ) -> Result<EdgeEsrTranscription>
-    where
-        Read: FnMut(&mut Vec<i16>) -> Result<bool>,
-        Emit: FnMut(EdgeEsrStreamUpdate) -> Result<()>,
-    {
+    ) -> Result<Vec<EdgeEsrVadSegment>> {
         if sample_rate as usize != SAMPLE_RATE {
-            bail!("EdgeEsr ASR requires a 16000 Hz sample rate")
+            bail!("EdgeEsr VAD requires a 16000 Hz sample rate")
         }
-        let started = std::time::Instant::now();
-        let _decoder_guard = self.decoder_guard()?;
-        let mut vgg = lock_session(&self.sessions.vgg_encoder)?;
-        let mut conformer = lock_session(&self.sessions.conformer_encoder)?;
-        let mut decoder1 = lock_session(&self.sessions.decoder_part1)?;
-        let mut decoder2 = lock_session(&self.sessions.decoder_part2)?;
-        let encoder = encoder::EdgeEsrEncoder::new(&mut vgg, &mut conformer)?;
-        let attention = MemoryTryAttention::new(
-            self.attention_weights.0.clone(),
-            self.attention_weights.1.clone(),
-            MemoryAttentionConfig::default(),
-        )?;
-        let decoder = decoder::EdgeEsrDecoder::new(
-            &mut decoder1,
-            &mut decoder2,
-            attention,
-            self.active_rows,
-        )?;
-        let mut recognizer = recognizer::EdgeEsrRecognizer::new(encoder, decoder);
-        let startup_chunks = recognizer.prime_encoder()?;
-        let mut pending = Vec::with_capacity(STREAM_ACCEPT_SAMPLES * 2);
-        let mut pending_cursor = 0;
-        let mut input_samples = 0;
-        let mut accepted_samples = 0;
-        let mut emission = StreamEmissionState::default();
-
-        loop {
-            if pending_cursor > 0 {
-                pending.drain(..pending_cursor);
-                pending_cursor = 0;
+        let mut vad = self
+            .sessions
+            .vad
+            .lock()
+            .map_err(|_| anyhow::anyhow!("EdgeEsr VAD lock poisoned"))?;
+        vad.reset();
+        let result = (|| {
+            let mut segments = Vec::new();
+            for chunk in samples.chunks(SAMPLE_RATE) {
+                segments.extend(vad.push(chunk)?);
             }
-            let previous_len = pending.len();
-            let has_more = read(&mut pending)?;
-            if pending.len() < previous_len {
-                bail!("EdgeEsr streaming input reader removed pending samples")
-            }
-            input_samples += pending.len() - previous_len;
-            while pending.len().saturating_sub(pending_cursor) >= STREAM_ACCEPT_SAMPLES {
-                let chunk_started = std::time::Instant::now();
-                recognizer.accept_pcm(
-                    &pending[pending_cursor..pending_cursor + STREAM_ACCEPT_SAMPLES],
-                    false,
-                )?;
-                pending_cursor += STREAM_ACCEPT_SAMPLES;
-                accepted_samples += STREAM_ACCEPT_SAMPLES;
-                trace!(
-                    elapsed_us = chunk_started.elapsed().as_micros(),
-                    accepted_samples = STREAM_ACCEPT_SAMPLES,
-                    "EdgeEsr streaming chunk accepted"
-                );
-                self.emit_partial_update(
-                    &recognizer,
-                    &mut emission,
-                    accepted_samples,
-                    &mut emit,
-                )?;
-            }
-            if !has_more {
-                break;
-            }
-        }
-        if input_samples == 0 {
-            bail!("EdgeEsr ASR input is empty")
-        }
-        if pending_cursor < pending.len() {
-            let remaining_samples = pending.len() - pending_cursor;
-            recognizer.accept_pcm(&pending[pending_cursor..], false)?;
-            accepted_samples += remaining_samples;
-            self.emit_partial_update(
-                &recognizer,
-                &mut emission,
-                accepted_samples,
-                &mut emit,
-            )?;
-        }
-        debug_assert_eq!(accepted_samples, input_samples);
-        recognizer.accept_pcm(&vec![0; SAMPLE_RATE * 4 / 5], true)?;
-        let timings = recognizer.timings();
-        let postprocess_started = std::time::Instant::now();
-        let mut transcription = self.recognizer_transcription(&recognizer, true)?;
-        emission.postprocess_elapsed += postprocess_started.elapsed();
-        transcription.token_timestamps = emission.token_timing.update(
-            &transcription.tokens,
-            samples_to_seconds(input_samples),
-        );
-        let revision = !emission.last_text.is_empty()
-            && !transcription.text.starts_with(&emission.last_text);
-        if revision {
-            emission.revision_count += 1;
-        }
-        emit(EdgeEsrStreamUpdate {
-            transcription: transcription.clone(),
-            revision,
-            revision_count: emission.revision_count,
-            sequence: emission.partial_count + 1,
-            final_result: true,
-        })?;
-        let compute_elapsed = timings.encoder
-            + timings.decoder
-            + timings.attention
-            + timings.beam
-            + emission.postprocess_elapsed;
-        info!(
-            stream_elapsed_ms = started.elapsed().as_millis(),
-            compute_ms = compute_elapsed.as_millis(),
-            encoder_ms = timings.encoder.as_millis(),
-            decoder_ms = timings.decoder.as_millis(),
-            attention_ms = timings.attention.as_millis(),
-            beam_ms = timings.beam.as_millis(),
-            postprocess_ms = emission.postprocess_elapsed.as_millis(),
-            startup_chunks,
-            partial_count = emission.partial_count,
-            revision_count = emission.revision_count,
-            token_count = transcription.tokens.len(),
-            timed_token_count = transcription
-                .token_timestamps
-                .as_ref()
-                .map_or(0, Vec::len),
-            "EdgeEsr transcription completed"
-        );
-        Ok(transcription)
-    }
-
-    fn emit_partial_update<Emit>(
-        &self,
-        recognizer: &recognizer::EdgeEsrRecognizer<'_>,
-        emission: &mut StreamEmissionState,
-        accepted_samples: usize,
-        emit: &mut Emit,
-    ) -> Result<()>
-    where
-        Emit: FnMut(EdgeEsrStreamUpdate) -> Result<()>,
-    {
-        let Some((path, _)) = recognizer.best_path() else {
-            return Ok(());
-        };
-        if path == emission.last_token_ids.as_slice() {
-            return Ok(());
-        }
-        emission.last_token_ids.clear();
-        emission.last_token_ids.extend_from_slice(path);
-        let started = std::time::Instant::now();
-        let mut transcription = self.recognizer_transcription(recognizer, false)?;
-        emission.postprocess_elapsed += started.elapsed();
-        transcription.token_timestamps = emission.token_timing.update(
-            &transcription.tokens,
-            samples_to_seconds(accepted_samples),
-        );
-        if transcription.text.is_empty() || transcription.text == emission.last_text {
-            return Ok(());
-        }
-        let revision = !emission.last_text.is_empty()
-            && !transcription.text.starts_with(emission.last_text.as_str());
-        if revision {
-            emission.revision_count += 1;
-        }
-        emission.partial_count += 1;
-        debug!(
-            sequence = emission.partial_count,
-            revision,
-            revision_count = emission.revision_count,
-            audio_end_ms = samples_to_milliseconds(accepted_samples),
-            text = %transcription.text,
-            "EdgeEsr partial transcription updated"
-        );
-        emission.last_text = transcription.text.clone();
-        emit(EdgeEsrStreamUpdate {
-            transcription,
-            revision,
-            revision_count: emission.revision_count,
-            sequence: emission.partial_count,
-            final_result: false,
-        })
+            segments.extend(vad.finish()?);
+            Ok(segments)
+        })();
+        vad.reset();
+        result
     }
 
     fn recognizer_transcription(

@@ -84,6 +84,37 @@ impl<'a> EdgeEsrEncoder<'a> {
         })
     }
 
+    pub(crate) fn reset(&mut self) -> Result<()> {
+        self.extractor = OriginalFeatureExtractor::default();
+        self.vgg_state.clear();
+        for index in 0..4 {
+            let name = format!("vgg_his_in_{}", index);
+            self.vgg_state
+                .insert(name.clone(), TensorData::zeros_for_input(self.vgg, &name)?);
+        }
+        self.conformer_state.clear();
+        for family in ["conv", "k", "v"] {
+            for index in 0..16 {
+                let name = format!("conformer_{}_his_in_{}", family, index);
+                self.conformer_state.insert(
+                    name.clone(),
+                    TensorData::zeros_for_input(self.conformer, &name)?,
+                );
+            }
+        }
+        self.pcm_buffer.clear();
+        self.pcm_cursor = 0;
+        self.feature_buffer.clear();
+        self.mask_buffer.clear();
+        self.vgg_output_buffer.clear();
+        self.vgg_mask_buffer.clear();
+        self.pending_conformer_chunks.clear();
+        self.vgg_calls = 0;
+        self.conformer_calls = 0;
+        self.finalized = false;
+        Ok(())
+    }
+
     pub(crate) fn prime_startup(&mut self) -> Result<Vec<EncoderChunk>> {
         if self.vgg_calls != 0 || self.conformer_calls != 0 || !self.feature_buffer.is_empty() {
             bail!("EdgeEsr encoder startup can only be primed after reset")
