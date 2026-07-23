@@ -84,7 +84,6 @@ struct StreamingOutput<'a> {
     config: &'a TranscriptionWorkerConfig,
     tracker: StablePrefixTracker,
     injection_error: Option<String>,
-    conflict: bool,
 }
 
 impl<'a> StreamingOutput<'a> {
@@ -93,23 +92,11 @@ impl<'a> StreamingOutput<'a> {
             config,
             tracker: StablePrefixTracker::default(),
             injection_error: None,
-            conflict: false,
         }
     }
 
     fn handle(&mut self, update: TranscriptionUpdate) -> Result<(), anyhow::Error> {
         let presentation = self.tracker.update(&update);
-        if presentation.conflict && !self.conflict {
-            self.conflict = true;
-            warn!(
-                sequence = update.sequence,
-                revision_count = update.revision_count,
-                "流式结果修正越过已落实前缀, 停止继续注入"
-            );
-        }
-        self.conflict |= presentation.conflict;
-        let committed_chars = presentation.commit.chars().count();
-        let final_result = presentation.final_result;
         self.config.overlay.set(streaming_overlay_state(
             &self.config.state,
             presentation.stable,
@@ -117,22 +104,12 @@ impl<'a> StreamingOutput<'a> {
             presentation.revision,
         ));
         if self.injection_error.is_none()
-            && !self.conflict
-            && !presentation.commit.is_empty()
+            && let Some(text) = final_injection_text(&update)
             && let Err(error) = type_text(
-                &presentation.commit,
-                final_result && self.config.append_newline,
+                text,
+                self.config.append_newline,
                 self.config.inject_method.clone(),
             )
-        {
-            self.injection_error = Some(error.to_string());
-        }
-        if self.injection_error.is_none()
-            && !self.conflict
-            && final_result
-            && presentation.commit.is_empty()
-            && self.config.append_newline
-            && let Err(error) = type_text("\n", false, self.config.inject_method.clone())
         {
             self.injection_error = Some(error.to_string());
         }
@@ -140,7 +117,6 @@ impl<'a> StreamingOutput<'a> {
             sequence = update.sequence,
             revision = update.revision,
             revision_count = update.revision_count,
-            committed_chars,
             final_result = update.final_result,
             "流式转写结果已处理"
         );
@@ -148,11 +124,12 @@ impl<'a> StreamingOutput<'a> {
     }
 
     fn final_error(&self) -> Option<String> {
-        self.injection_error.clone().or_else(|| {
-            self.conflict
-                .then(|| "流式修正越过已落实前缀, 已停止继续注入".to_string())
-        })
+        self.injection_error.clone()
     }
+}
+
+fn final_injection_text(update: &TranscriptionUpdate) -> Option<&str> {
+    (update.final_result && !update.result.text.is_empty()).then_some(update.result.text.as_str())
 }
 
 pub(super) fn transcription_worker(
@@ -386,6 +363,7 @@ fn handle_worker_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::asr::TranscriptionResult;
     use crate::vad::SegmentReason;
 
     fn segment(sample: i16) -> SpeechSegment {
@@ -397,6 +375,26 @@ mod tests {
             end_sample: 1,
             audio_start_sample: 0,
             audio_end_sample: 1,
+        }
+    }
+
+    fn transcription_update(text: &str, final_result: bool) -> TranscriptionUpdate {
+        TranscriptionUpdate {
+            result: TranscriptionResult {
+                success: !text.is_empty(),
+                text: text.to_string(),
+                raw_text: text.to_string(),
+                tokens: Vec::new(),
+                token_timestamps: None,
+                duration: 1.0,
+                inference_latency: 0.1,
+                confidence: 1.0,
+                error: None,
+            },
+            revision: false,
+            revision_count: 0,
+            sequence: 1,
+            final_result,
         }
     }
 
@@ -457,6 +455,18 @@ mod tests {
         assert!(input.read(&mut buffer).unwrap());
         drop(tx);
         assert!(input.read(&mut buffer).is_err());
+    }
+
+    #[test]
+    fn injects_only_the_complete_final_text() {
+        let partial = transcription_update("实时结果", false);
+        assert!(final_injection_text(&partial).is_none());
+
+        let final_result = transcription_update("最终完整结果", true);
+        assert_eq!(final_injection_text(&final_result), Some("最终完整结果"));
+
+        let empty_final = transcription_update("", true);
+        assert!(final_injection_text(&empty_final).is_none());
     }
 
 }
