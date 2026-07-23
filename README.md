@@ -19,6 +19,8 @@ VocoType 是一个本地语音转写和文本注入工具. 默认使用 sherpa-o
 
 ## 快速开始
 
+两种后端的能力差异, 模型组成和流式行为见 [ASR 后端对比](docs/asr-backends.md).
+
 安装或构建后, 先下载模型:
 
 ```shell
@@ -97,6 +99,8 @@ vocotype transcribe input.wav --format srt --output input.srt
 ## 用户词汇表
 
 默认词汇表路径是 `~/.config/vocotype/dict.toml`. 可以用 `vocotype dict default` 输出模板, 再保存为自己的 `dict.toml`.
+
+不同后端对 `hotwords`, `rewrites` 和 `hotwords_score` 的影响见 [ASR 后端对比](docs/asr-backends.md).
 
 词表支持三类内容:
 
