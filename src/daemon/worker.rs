@@ -99,7 +99,7 @@ impl<'a> StreamingOutput<'a> {
 
     fn handle(&mut self, update: TranscriptionUpdate) -> Result<(), anyhow::Error> {
         let presentation = self.tracker.update(&update);
-        if presentation.conflict {
+        if presentation.conflict && !self.conflict {
             self.conflict = true;
             warn!(
                 sequence = update.sequence,
@@ -107,6 +107,7 @@ impl<'a> StreamingOutput<'a> {
                 "流式结果修正越过已落实前缀, 停止继续注入"
             );
         }
+        self.conflict |= presentation.conflict;
         let committed_chars = presentation.commit.chars().count();
         let final_result = presentation.final_result;
         self.config.overlay.set(streaming_overlay_state(

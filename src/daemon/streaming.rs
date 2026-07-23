@@ -2,8 +2,8 @@ use std::collections::VecDeque;
 
 use crate::asr::TranscriptionUpdate;
 
-const STABILITY_HISTORY: usize = 3;
-const UNSTABLE_TAIL_TOKENS: usize = 3;
+const STABILITY_HISTORY: usize = 5;
+const UNSTABLE_TAIL_TOKENS: usize = 8;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(super) struct StreamPresentation {
@@ -25,12 +25,23 @@ struct StreamSnapshot {
 pub(super) struct StablePrefixTracker {
     history: VecDeque<StreamSnapshot>,
     committed: String,
+    revision_seen: bool,
 }
 
 impl StablePrefixTracker {
     pub(super) fn update(&mut self, update: &TranscriptionUpdate) -> StreamPresentation {
         if update.final_result {
             return self.finish(update);
+        }
+
+        let current = &update.result.text;
+        if !current.starts_with(&self.committed) {
+            return self.presentation(current, String::new(), update.revision, true, false);
+        }
+
+        if update.revision || (update.revision_count > 0 && !self.revision_seen) {
+            self.revision_seen = true;
+            self.history.clear();
         }
 
         self.history.push_back(StreamSnapshot {
@@ -41,8 +52,7 @@ impl StablePrefixTracker {
             let _ = self.history.pop_front();
         }
 
-        let current = &update.result.text;
-        if self.history.len() < STABILITY_HISTORY {
+        if self.revision_seen || self.history.len() < STABILITY_HISTORY {
             return self.presentation(current, String::new(), update.revision, false, false);
         }
 
@@ -52,17 +62,13 @@ impl StablePrefixTracker {
             .tokens
             .len()
             .saturating_sub(UNSTABLE_TAIL_TOKENS);
-        let mut stable_tokens = common_tokens.min(tail_limit);
-        while stable_tokens > 0
-            && token_needs_final_boundary(&update.result.tokens[stable_tokens - 1])
-        {
-            stable_tokens -= 1;
-        }
+        let stable_tokens = common_tokens.min(tail_limit);
 
         let token_prefix = update.result.tokens[..stable_tokens].concat();
         let text_prefix_chars = common_text_prefix_chars(&self.history);
         let candidate_chars = token_prefix.chars().count().min(text_prefix_chars);
         let candidate = current.chars().take(candidate_chars).collect::<String>();
+        let candidate = candidate[..last_commit_boundary(&candidate)].to_string();
         if !candidate.starts_with(&self.committed) {
             return self.presentation(current, String::new(), update.revision, true, false);
         }
@@ -136,14 +142,43 @@ fn common_text_prefix_chars(history: &VecDeque<StreamSnapshot>) -> usize {
     length
 }
 
-fn token_needs_final_boundary(token: &str) -> bool {
-    token.chars().any(|character| {
-        character.is_ascii_alphanumeric()
-            || matches!(
-                character,
-                ',' | '.' | ':' | ';' | '!' | '?' | '%' | '/' | '-' | '+' | '=' | '@' | '#'
-            )
-    })
+fn last_commit_boundary(text: &str) -> usize {
+    let characters = text.char_indices().collect::<Vec<_>>();
+    let mut boundary = 0;
+    for (index, (byte_index, character)) in characters.iter().copied().enumerate() {
+        let previous = index
+            .checked_sub(1)
+            .and_then(|index| characters.get(index))
+            .map(|(_, character)| *character);
+        let next = characters
+            .get(index + 1)
+            .map(|(_, character)| *character);
+        if is_commit_boundary(character, previous, next) {
+            boundary = byte_index + character.len_utf8();
+        }
+    }
+    boundary
+}
+
+fn is_commit_boundary(
+    character: char,
+    previous: Option<char>,
+    next: Option<char>,
+) -> bool {
+    if matches!(
+        character,
+        '\u{ff0c}' | '\u{3002}' | '\u{ff01}' | '\u{ff1f}' | '\u{ff1b}'
+    ) {
+        return true;
+    }
+    if !matches!(character, ',' | '.' | '!' | '?' | ';') {
+        return false;
+    }
+    !matches!(
+        (previous, next),
+        (Some(previous), Some(next))
+            if previous.is_ascii_alphanumeric() && next.is_ascii_alphanumeric()
+    )
 }
 
 #[cfg(test)]
@@ -151,7 +186,12 @@ mod tests {
     use super::*;
     use crate::asr::TranscriptionResult;
 
-    fn update(text: &str, final_result: bool) -> TranscriptionUpdate {
+    fn update_with_revision(
+        text: &str,
+        revision: bool,
+        revision_count: usize,
+        final_result: bool,
+    ) -> TranscriptionUpdate {
         TranscriptionUpdate {
             result: TranscriptionResult {
                 success: true,
@@ -164,60 +204,115 @@ mod tests {
                 confidence: 1.0,
                 error: None,
             },
-            revision: false,
-            revision_count: 0,
+            revision,
+            revision_count,
             sequence: 1,
             final_result,
         }
     }
 
+    fn update(text: &str, final_result: bool) -> TranscriptionUpdate {
+        update_with_revision(text, false, 0, final_result)
+    }
+
+    fn commit_first_clause(tracker: &mut StablePrefixTracker) -> StreamPresentation {
+        let _ = tracker.update(&update("这是一个离线语音识别模型测试，今天", false));
+        let _ = tracker.update(&update("这是一个离线语音识别模型测试，今天天气", false));
+        let _ = tracker.update(&update("这是一个离线语音识别模型测试，今天天气很好", false));
+        let _ = tracker.update(&update(
+            "这是一个离线语音识别模型测试，今天天气很好我们",
+            false,
+        ));
+        tracker.update(&update(
+            "这是一个离线语音识别模型测试，今天天气很好我们正在",
+            false,
+        ))
+    }
+
     #[test]
-    fn commits_only_the_prefix_shared_by_three_partials() {
+    fn commits_only_a_punctuation_terminated_stable_clause() {
         let mut tracker = StablePrefixTracker::default();
-        assert!(tracker.update(&update("这是一个无线", false)).commit.is_empty());
-        assert!(
-            tracker
-                .update(&update("这是一个离线语音", false))
-                .commit
-                .is_empty()
-        );
-        let result = tracker.update(&update("这是一个离线语音识别", false));
-        assert_eq!(result.commit, "这是一个");
-        assert_eq!(result.stable, "这是一个");
-        assert_eq!(result.unstable, "离线语音识别");
+        let result = commit_first_clause(&mut tracker);
+        assert_eq!(result.commit, "这是一个离线语音识别模型测试，");
+        assert_eq!(result.stable, "这是一个离线语音识别模型测试，");
+        assert_eq!(result.unstable, "今天天气很好我们正在");
+    }
+
+    #[test]
+    fn does_not_commit_a_partial_clause_without_punctuation() {
+        let mut tracker = StablePrefixTracker::default();
+        for _ in 0..STABILITY_HISTORY {
+            let result = tracker.update(&update("这是一个仍会继续校准的长句子", false));
+            assert!(result.commit.is_empty());
+        }
     }
 
     #[test]
     fn final_commits_only_the_remaining_suffix() {
         let mut tracker = StablePrefixTracker::default();
-        let _ = tracker.update(&update("这是一个离线语音", false));
-        let _ = tracker.update(&update("这是一个离线语音识别", false));
-        let partial = tracker.update(&update("这是一个离线语音识别模型", false));
-        assert_eq!(partial.commit, "这是一个离线语音");
-        let final_result = tracker.update(&update("这是一个离线语音识别模型测试,", true));
-        assert_eq!(final_result.commit, "识别模型测试,");
+        let partial = commit_first_clause(&mut tracker);
+        assert_eq!(partial.commit, "这是一个离线语音识别模型测试，");
+        let final_result = tracker.update(&update(
+            "这是一个离线语音识别模型测试，今天天气很好。",
+            true,
+        ));
+        assert_eq!(final_result.commit, "今天天气很好。");
         assert!(final_result.unstable.is_empty());
     }
 
     #[test]
-    fn keeps_ascii_and_punctuation_at_the_unstable_boundary() {
+    fn does_not_treat_decimal_punctuation_as_a_commit_boundary() {
         let mut tracker = StablePrefixTracker::default();
-        let _ = tracker.update(&update("版本12.", false));
-        let _ = tracker.update(&update("版本12.3", false));
-        let partial = tracker.update(&update("版本12.34完成", false));
-        assert_eq!(partial.commit, "版本");
-        assert_eq!(partial.unstable, "12.34完成");
+        for _ in 0..STABILITY_HISTORY {
+            let partial = tracker.update(&update("版本12.34完成后继续处理", false));
+            assert!(partial.commit.is_empty());
+        }
+    }
+
+    #[test]
+    fn freezes_partial_commits_after_the_first_revision() {
+        let mut tracker = StablePrefixTracker::default();
+        let _ = commit_first_clause(&mut tracker);
+        let revision = tracker.update(&update_with_revision(
+            "这是一个离线语音识别模型测试，今天天气真好",
+            true,
+            1,
+            false,
+        ));
+        assert!(!revision.conflict);
+        assert!(revision.commit.is_empty());
+
+        for _ in 0..STABILITY_HISTORY {
+            let partial = tracker.update(&update_with_revision(
+                "这是一个离线语音识别模型测试，今天天气真好，我们正在继续",
+                false,
+                1,
+                false,
+            ));
+            assert!(partial.commit.is_empty());
+        }
+
+        let final_result = tracker.update(&update_with_revision(
+            "这是一个离线语音识别模型测试，今天天气真好，我们正在继续。",
+            false,
+            1,
+            true,
+        ));
+        assert_eq!(final_result.commit, "今天天气真好，我们正在继续。");
     }
 
     #[test]
     fn reports_conflict_when_revision_crosses_the_committed_prefix() {
         let mut tracker = StablePrefixTracker::default();
-        let _ = tracker.update(&update("这是一个离线语音", false));
-        let _ = tracker.update(&update("这是一个离线语音", false));
-        let committed = tracker.update(&update("这是一个离线语音", false));
+        let committed = commit_first_clause(&mut tracker);
         assert!(!committed.commit.is_empty());
 
-        let revision = tracker.update(&update("那是一个离线语音", false));
+        let revision = tracker.update(&update_with_revision(
+            "那是一个离线语音识别模型测试，今天天气很好",
+            true,
+            1,
+            false,
+        ));
         assert!(revision.conflict);
         assert!(revision.commit.is_empty());
     }

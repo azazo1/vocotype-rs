@@ -400,8 +400,14 @@ impl EdgeEsrRuntime {
             sequence: emission.partial_count + 1,
             final_result: true,
         })?;
+        let compute_elapsed = timings.encoder
+            + timings.decoder
+            + timings.attention
+            + timings.beam
+            + emission.postprocess_elapsed;
         info!(
-            elapsed_ms = started.elapsed().as_millis(),
+            stream_elapsed_ms = started.elapsed().as_millis(),
+            compute_ms = compute_elapsed.as_millis(),
             encoder_ms = timings.encoder.as_millis(),
             decoder_ms = timings.decoder.as_millis(),
             attention_ms = timings.attention.as_millis(),

@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::cell::Cell;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
@@ -270,6 +270,7 @@ impl AsrEngine {
         };
         let start = Instant::now();
         let input_samples = Cell::new(0usize);
+        let read_elapsed = Cell::new(Duration::ZERO);
         let mut final_result = None;
         let mut last_text = String::new();
         let mut revision_count = 0;
@@ -277,15 +278,22 @@ impl AsrEngine {
             TARGET_SAMPLE_RATE,
             |buffer| {
                 let previous_len = buffer.len();
-                let has_more = read(buffer)?;
+                let read_started = Instant::now();
+                let read_result = read(buffer);
+                read_elapsed.set(read_elapsed.get() + read_started.elapsed());
+                let has_more = read_result?;
                 input_samples.set(input_samples.get() + buffer.len() - previous_len);
                 Ok(has_more)
             },
             |update| {
                 let duration = input_samples.get() as f32 / TARGET_SAMPLE_RATE as f32;
+                let latency = start
+                    .elapsed()
+                    .saturating_sub(read_elapsed.get())
+                    .as_secs_f32();
                 let result = self.build_result(
                     duration,
-                    start.elapsed().as_secs_f32(),
+                    latency,
                     DecodedResult {
                         raw_text: update.transcription.text.trim().to_string(),
                         tokens: update.transcription.tokens,
