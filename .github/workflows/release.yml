@@ -1,0 +1,207 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+      - "[0-9]*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate release tag
+    runs-on: macos-15
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      is_prerelease: ${{ steps.version.outputs.is_prerelease }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+
+      - id: version
+        name: Validate tag against Cargo metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          semver_pattern='^v?([0-9]+)\.([0-9]+)\.([0-9]+)(-[0-9A-Za-z][0-9A-Za-z.-]*)?(\+[0-9A-Za-z][0-9A-Za-z.-]*)?$'
+
+          if ! [[ "$tag" =~ $semver_pattern ]]; then
+            printf '无效的发布 tag: %s\n' "$tag" >&2
+            exit 1
+          fi
+
+          version="${tag#v}"
+          package_version="$(cargo metadata --locked --no-deps --format-version 1 | jq -er '.packages[] | select(.name == "vocotype-rs") | .version')"
+
+          if [ "$version" != "$package_version" ]; then
+            printf 'tag 版本 %s 与 Cargo 版本 %s 不一致\n' "$version" "$package_version" >&2
+            exit 1
+          fi
+
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+          case "$version" in
+            *-*) printf 'is_prerelease=true\n' >> "$GITHUB_OUTPUT" ;;
+            *) printf 'is_prerelease=false\n' >> "$GITHUB_OUTPUT" ;;
+          esac
+
+  build:
+    name: Build ${{ matrix.platform }} ${{ matrix.architecture }} package
+    needs: validate
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            platform: macos
+            architecture: aarch64
+            archive_extension: tar.gz
+    env:
+      VERSION: ${{ needs.validate.outputs.version }}
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+
+      - name: Verify native architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$(uname -m)" != "arm64" ]; then
+            printf '预期 ARM64 runner, 实际架构为 %s\n' "$(uname -m)" >&2
+            exit 1
+          fi
+
+      - name: Build macOS app bundle
+        shell: bash
+        env:
+          APP_VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          sh scripts/package-macos-app.sh
+
+      - name: Smoke test application binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/macos-app/VocoType.app/Contents/MacOS/vocotype"
+          test -x "$binary"
+          "$binary" --version
+
+      - name: Archive macOS ARM64 application
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="vocotype-${VERSION}-${{ matrix.platform }}-${{ matrix.architecture }}.${{ matrix.archive_extension }}"
+          mkdir -p dist
+          tar -C target/macos-app -czf "dist/$archive" VocoType.app
+          test -s "dist/$archive"
+
+      - name: Upload macOS ARM64 archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: vocotype-${{ matrix.platform }}-${{ matrix.architecture }}
+          path: dist/vocotype-${{ needs.validate.outputs.version }}-${{ matrix.platform }}-${{ matrix.architecture }}.${{ matrix.archive_extension }}
+          if-no-files-found: error
+          retention-days: 7
+
+  tag-notes:
+    name: Extract annotated tag notes
+    needs: validate
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+
+      - name: Extract manually written tag notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          tag_type="$(git cat-file -t "refs/tags/$tag")"
+
+          if [ "$tag_type" != "tag" ]; then
+            printf '发布 tag 必须是带有手写说明的 annotated tag: %s\n' "$tag" >&2
+            exit 1
+          fi
+
+          git for-each-ref "refs/tags/$tag" --format='%(contents)' > release-notes.md
+          if ! grep -q '[^[:space:]]' release-notes.md; then
+            printf '发布 tag 的手写说明不能为空: %s\n' "$tag" >&2
+            exit 1
+          fi
+
+      - name: Upload manually written tag notes
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: tag-notes
+          path: release-notes.md
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Create GitHub release
+    needs:
+      - validate
+      - build
+      - tag-notes
+    runs-on: macos-15
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.validate.outputs.version }}
+      IS_PRERELEASE: ${{ needs.validate.outputs.is_prerelease }}
+    steps:
+      - name: Download macOS ARM64 archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: vocotype-macos-aarch64
+          path: dist
+
+      - name: Download manually written tag notes
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: tag-notes
+          path: tag-notes
+
+      - name: Verify release assets and generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="dist/vocotype-${VERSION}-macos-aarch64.tar.gz"
+          notes="tag-notes/release-notes.md"
+
+          test -s "$archive"
+          test -s "$notes"
+          shasum -a 256 "$archive" > dist/SHA256SUMS
+          test -s dist/SHA256SUMS
+
+      - name: Create GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          archive="dist/vocotype-${VERSION}-macos-aarch64.tar.gz"
+          checksums="dist/SHA256SUMS"
+          notes="tag-notes/release-notes.md"
+          title="VocoType v${VERSION}"
+          release_args=(release create "$tag" "$archive" "$checksums" --verify-tag --title "$title" --notes-file "$notes")
+
+          if [ "$IS_PRERELEASE" = "true" ]; then
+            release_args+=(--prerelease)
+          fi
+
+          gh "${release_args[@]}"

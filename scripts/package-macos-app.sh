@@ -15,7 +15,7 @@ ICON_NAME="app-icon"
 ICON_FILE="$ICON_NAME.icns"
 ICON_SOURCE="assets/$ICON_FILE"
 
-cargo build --release --bin "$BIN_NAME"
+cargo build --locked --release --bin "$BIN_NAME"
 
 rm -rf "$APP_DIR"
 mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
