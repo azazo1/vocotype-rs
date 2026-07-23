@@ -5,7 +5,7 @@ mod fonts;
 mod platform;
 mod state;
 
-pub(super) const OVERLAY_WIDTH: f32 = 560.0;
+pub(super) const OVERLAY_WIDTH: f32 = 320.0;
 
 use std::sync::{Arc, Mutex};
 
