@@ -8,7 +8,7 @@ use iflytek_core::{
 };
 use ort::session::Session;
 use ort::value::Tensor;
-use tracing::{info, trace};
+use tracing::{debug, info, trace};
 
 const STACKED_FRAMES: usize = 4;
 const VAD_INPUT_SIZE: usize = VAD_FEATURE_SIZE * STACKED_FRAMES;
@@ -105,10 +105,7 @@ impl EdgeEsrVad {
         super::init_onnx_runtime_api()?;
         let session = super::load_plain_session(path, super::default_intra_threads())?;
         let extractor = OriginalFeatureExtractor::with_feature_size(VAD_FEATURE_SIZE)?;
-        let endpoint = OriginalVadEndpoint::new(VadEndpointConfig {
-            vad_threshold: config.threshold,
-            ..VadEndpointConfig::default()
-        })?;
+        let endpoint = OriginalVadEndpoint::new(endpoint_config(&config))?;
         let runtime = Self {
             config,
             session,
@@ -365,6 +362,19 @@ impl EdgeEsrVad {
         let speech_start_sample = speech_start_sample.min(self.samples.len());
         let speech_end_sample = speech_end_sample.max(speech_start_sample).min(self.samples.len());
         let speech_len = speech_end_sample.saturating_sub(speech_start_sample);
+        if audio_end <= audio_start
+            || speech_len == 0
+            || speech_len < self.samples_for_ms(self.config.min_speech_ms)
+        {
+            debug!(
+                audio_start,
+                audio_end,
+                speech_start_sample,
+                speech_end_sample,
+                "EdgeEsr VAD 丢弃空片段或过短片段"
+            );
+            return None;
+        }
         let reason = if final_flush {
             EdgeEsrVadSegmentReason::Finish
         } else if speech_len >= self.samples_for_ms(self.config.max_segment_ms) {
@@ -388,6 +398,23 @@ impl EdgeEsrVad {
     }
 }
 
+fn endpoint_config(config: &EdgeEsrVadConfig) -> VadEndpointConfig {
+    VadEndpointConfig {
+        frame_start_margin: milliseconds_to_frames(config.pre_roll_ms, config.sample_rate),
+        frame_end_margin: milliseconds_to_frames(config.tail_padding_ms, config.sample_rate),
+        end_gap: milliseconds_to_frames(config.end_silence_ms, config.sample_rate),
+        vad_threshold: config.threshold,
+        force_segment: milliseconds_to_frames(config.max_segment_ms, config.sample_rate),
+        ..VadEndpointConfig::default()
+    }
+}
+
+fn milliseconds_to_frames(milliseconds: u32, sample_rate: u32) -> i32 {
+    let samples = u64::from(milliseconds).saturating_mul(u64::from(sample_rate)) / 1_000;
+    let frames = samples / SAMPLES_PER_FRAME as u64;
+    frames.min(i32::MAX as u64) as i32
+}
+
 fn frame_energy_active(samples: &[i16], frame: usize) -> bool {
     let start = frame * SAMPLES_PER_FRAME;
     let end = start.saturating_add(SAMPLES_PER_FRAME);
@@ -400,4 +427,38 @@ fn frame_energy_active(samples: &[i16], frame: usize) -> bool {
         .sum::<i64>();
     let mean_square = square_sum as f32 / SAMPLES_PER_FRAME as f32;
     (mean_square + 1.0).ln() > 0.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn endpoint_config_uses_application_vad_durations() {
+        let config = EdgeEsrVadConfig {
+            sample_rate: 16_000,
+            threshold: 0.5,
+            pre_roll_ms: 180,
+            tail_padding_ms: 180,
+            end_silence_ms: 650,
+            min_speech_ms: 240,
+            max_segment_ms: 15_000,
+        };
+
+        let endpoint = endpoint_config(&config);
+
+        assert_eq!(endpoint.frame_start_margin, 18);
+        assert_eq!(endpoint.frame_end_margin, 18);
+        assert_eq!(endpoint.end_gap, 65);
+        assert_eq!(endpoint.force_segment, 1_500);
+        assert_eq!(endpoint.vad_threshold, 0.5);
+    }
+
+    #[test]
+    fn milliseconds_convert_to_ten_millisecond_frames() {
+        assert_eq!(milliseconds_to_frames(0, 16_000), 0);
+        assert_eq!(milliseconds_to_frames(9, 16_000), 0);
+        assert_eq!(milliseconds_to_frames(10, 16_000), 1);
+        assert_eq!(milliseconds_to_frames(655, 16_000), 65);
+    }
 }
