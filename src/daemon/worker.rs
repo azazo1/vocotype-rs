@@ -4,7 +4,9 @@ use std::time::Duration;
 use crossbeam_channel::Receiver;
 use tracing::{debug, error, info, warn};
 
-use crate::asr::{AsrEngine, AsrOptions, TARGET_SAMPLE_RATE, TranscriptionResult};
+use crate::asr::{
+    AsrEngine, AsrOptions, TARGET_SAMPLE_RATE, TranscriptionResult, TranscriptionUpdate,
+};
 use crate::dataset::DatasetRecorder;
 use crate::inject::{InjectMethod, type_text};
 use crate::models::ModelStore;
@@ -13,7 +15,9 @@ use crate::vad::SpeechSegment;
 
 use super::state::{
     SharedRuntimeState, final_mode, finish_queue_item, overlay_state_with_lines,
+    streaming_overlay_state,
 };
+use super::streaming::StablePrefixTracker;
 
 pub(super) struct TranscriptionWorkerConfig {
     pub store: ModelStore,
@@ -26,17 +30,141 @@ pub(super) struct TranscriptionWorkerConfig {
     pub asr_options: AsrOptions,
 }
 
+pub(super) enum TranscriptionTask {
+    Segment(SpeechSegment),
+    StreamStart(Vec<i16>),
+    StreamAudio(Vec<i16>),
+    StreamFinish(SpeechSegment),
+}
+
+struct LiveStreamInput<'a> {
+    task_rx: &'a Receiver<TranscriptionTask>,
+    initial: Option<Vec<i16>>,
+    final_segment: Option<SpeechSegment>,
+}
+
+impl<'a> LiveStreamInput<'a> {
+    fn new(task_rx: &'a Receiver<TranscriptionTask>, initial: Vec<i16>) -> Self {
+        Self {
+            task_rx,
+            initial: Some(initial),
+            final_segment: None,
+        }
+    }
+
+    fn read(&mut self, buffer: &mut Vec<i16>) -> anyhow::Result<bool> {
+        if let Some(initial) = self.initial.take() {
+            buffer.extend(initial);
+            return Ok(true);
+        }
+        match self.task_rx.recv() {
+            Ok(TranscriptionTask::StreamAudio(samples)) => {
+                buffer.extend(samples);
+                Ok(true)
+            }
+            Ok(TranscriptionTask::StreamFinish(segment)) => {
+                self.final_segment = Some(segment);
+                Ok(false)
+            }
+            Ok(TranscriptionTask::Segment(_)) | Ok(TranscriptionTask::StreamStart(_)) => {
+                anyhow::bail!("实时流式任务顺序无效")
+            }
+            Err(error) => Err(anyhow::anyhow!("实时流式输入通道已关闭: {}", error)),
+        }
+    }
+
+    fn finish(mut self) -> Option<SpeechSegment> {
+        self.final_segment
+            .take()
+            .or_else(|| drain_stream_finish(self.task_rx))
+    }
+}
+
+struct StreamingOutput<'a> {
+    config: &'a TranscriptionWorkerConfig,
+    tracker: StablePrefixTracker,
+    injection_error: Option<String>,
+    conflict: bool,
+}
+
+impl<'a> StreamingOutput<'a> {
+    fn new(config: &'a TranscriptionWorkerConfig) -> Self {
+        Self {
+            config,
+            tracker: StablePrefixTracker::default(),
+            injection_error: None,
+            conflict: false,
+        }
+    }
+
+    fn handle(&mut self, update: TranscriptionUpdate) -> Result<(), anyhow::Error> {
+        let presentation = self.tracker.update(&update);
+        if presentation.conflict {
+            self.conflict = true;
+            warn!(
+                sequence = update.sequence,
+                revision_count = update.revision_count,
+                "流式结果修正越过已落实前缀, 停止继续注入"
+            );
+        }
+        let committed_chars = presentation.commit.chars().count();
+        let final_result = presentation.final_result;
+        self.config.overlay.set(streaming_overlay_state(
+            &self.config.state,
+            presentation.stable,
+            presentation.unstable,
+            presentation.revision,
+        ));
+        if self.injection_error.is_none()
+            && !self.conflict
+            && !presentation.commit.is_empty()
+            && let Err(error) = type_text(
+                &presentation.commit,
+                final_result && self.config.append_newline,
+                self.config.inject_method.clone(),
+            )
+        {
+            self.injection_error = Some(error.to_string());
+        }
+        if self.injection_error.is_none()
+            && !self.conflict
+            && final_result
+            && presentation.commit.is_empty()
+            && self.config.append_newline
+            && let Err(error) = type_text("\n", false, self.config.inject_method.clone())
+        {
+            self.injection_error = Some(error.to_string());
+        }
+        debug!(
+            sequence = update.sequence,
+            revision = update.revision,
+            revision_count = update.revision_count,
+            committed_chars,
+            final_result = update.final_result,
+            "流式转写结果已处理"
+        );
+        Ok(())
+    }
+
+    fn final_error(&self) -> Option<String> {
+        self.injection_error.clone().or_else(|| {
+            self.conflict
+                .then(|| "流式修正越过已落实前缀, 已停止继续注入".to_string())
+        })
+    }
+}
+
 pub(super) fn transcription_worker(
     config: TranscriptionWorkerConfig,
-    segment_rx: Receiver<SpeechSegment>,
+    task_rx: Receiver<TranscriptionTask>,
 ) {
     let mut engine: Option<Arc<AsrEngine>> = None;
     let idle_timeout =
         (config.idle_unload_secs > 0).then(|| Duration::from_secs(config.idle_unload_secs));
 
     loop {
-        let segment = match recv_segment(&segment_rx, idle_timeout) {
-            WorkerEvent::Segment(segment) => segment,
+        let task = match recv_task(&task_rx, idle_timeout) {
+            WorkerEvent::Task(task) => task,
             WorkerEvent::Idle => {
                 if engine.take().is_some() {
                     info!(idle_secs = config.idle_unload_secs, "空闲卸载 ASR 和 PUNC 模型");
@@ -48,6 +176,9 @@ pub(super) fn transcription_worker(
         let engine = match ensure_engine(&mut engine, &config.store, config.asr_options.clone()) {
             Ok(engine) => engine,
             Err(error) => {
+                if matches!(&task, TranscriptionTask::StreamStart(_)) {
+                    let _ = drain_stream_finish(&task_rx);
+                }
                 handle_worker_error(
                     &config.overlay,
                     &config.state,
@@ -56,11 +187,54 @@ pub(super) fn transcription_worker(
                 continue;
             }
         };
-        let pcm = crate::wav::PcmAudio {
-            sample_rate: TARGET_SAMPLE_RATE,
-            samples: segment.samples.clone(),
+        let (segment, transcribed, streaming, stream_injection_error) = match task {
+            TranscriptionTask::Segment(segment) => {
+                let pcm = crate::wav::PcmAudio {
+                    sample_rate: TARGET_SAMPLE_RATE,
+                    samples: segment.samples.clone(),
+                };
+                if engine.supports_streaming() {
+                    let mut output = StreamingOutput::new(&config);
+                    let transcribed = engine
+                        .transcribe_pcm_streaming(&pcm, |update| output.handle(update));
+                    (segment, transcribed, true, output.final_error())
+                } else {
+                    let transcribed = engine.transcribe_pcm(&pcm);
+                    (segment, transcribed, false, None)
+                }
+            }
+            TranscriptionTask::StreamStart(initial) => {
+                if !engine.supports_streaming() {
+                    let _ = drain_stream_finish(&task_rx);
+                    handle_worker_error(
+                        &config.overlay,
+                        &config.state,
+                        "当前 ASR 后端不支持实时流式输入".to_string(),
+                    );
+                    continue;
+                }
+                let mut input = LiveStreamInput::new(&task_rx, initial);
+                let mut output = StreamingOutput::new(&config);
+                let transcribed = engine.transcribe_live_pcm(
+                    |buffer| input.read(buffer),
+                    |update| output.handle(update),
+                );
+                let Some(segment) = input.finish() else {
+                    handle_worker_error(
+                        &config.overlay,
+                        &config.state,
+                        "实时流式输入没有结束语音段".to_string(),
+                    );
+                    continue;
+                };
+                (segment, transcribed, true, output.final_error())
+            }
+            TranscriptionTask::StreamAudio(_) | TranscriptionTask::StreamFinish(_) => {
+                warn!("收到没有开始事件的实时流式任务");
+                continue;
+            }
         };
-        let result = match engine.transcribe_pcm(&pcm) {
+        let result = match transcribed {
             Ok(result) => result,
             Err(error) => TranscriptionResult {
                 success: false,
@@ -68,7 +242,7 @@ pub(super) fn transcription_worker(
                 raw_text: String::new(),
                 tokens: Vec::new(),
                 token_timestamps: None,
-                duration: pcm.duration_seconds(),
+                duration: segment.speech_ms as f32 / 1_000.0,
                 inference_latency: 0.0,
                 confidence: 0.0,
                 error: Some(error.to_string()),
@@ -92,9 +266,18 @@ pub(super) fn transcription_worker(
         };
 
         if result.success {
-            if let Err(error) =
-                type_text(&output_text, config.append_newline, config.inject_method.clone())
-            {
+            let injection_error = if streaming {
+                stream_injection_error
+            } else {
+                type_text(
+                    &output_text,
+                    config.append_newline,
+                    config.inject_method.clone(),
+                )
+                .err()
+                .map(|error| error.to_string())
+            };
+            if let Some(error) = injection_error {
                 config.overlay.set(overlay_state_with_lines(
                     OverlayMode::Error {
                         message: format!("文本注入失败: {}", error),
@@ -133,25 +316,35 @@ pub(super) fn transcription_worker(
 }
 
 enum WorkerEvent {
-    Segment(SpeechSegment),
+    Task(TranscriptionTask),
     Idle,
     Closed,
 }
 
-fn recv_segment(
-    segment_rx: &Receiver<SpeechSegment>,
+fn recv_task(
+    task_rx: &Receiver<TranscriptionTask>,
     idle_timeout: Option<Duration>,
 ) -> WorkerEvent {
     match idle_timeout {
-        Some(timeout) => match segment_rx.recv_timeout(timeout) {
-            Ok(segment) => WorkerEvent::Segment(segment),
+        Some(timeout) => match task_rx.recv_timeout(timeout) {
+            Ok(task) => WorkerEvent::Task(task),
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => WorkerEvent::Idle,
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => WorkerEvent::Closed,
         },
-        None => match segment_rx.recv() {
-            Ok(segment) => WorkerEvent::Segment(segment),
+        None => match task_rx.recv() {
+            Ok(task) => WorkerEvent::Task(task),
             Err(_) => WorkerEvent::Closed,
         },
+    }
+}
+
+fn drain_stream_finish(task_rx: &Receiver<TranscriptionTask>) -> Option<SpeechSegment> {
+    loop {
+        match task_rx.recv().ok()? {
+            TranscriptionTask::StreamFinish(segment) => return Some(segment),
+            TranscriptionTask::StreamAudio(_) => {}
+            TranscriptionTask::Segment(_) | TranscriptionTask::StreamStart(_) => return None,
+        }
     }
 }
 
@@ -192,20 +385,77 @@ fn handle_worker_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vad::SegmentReason;
+
+    fn segment(sample: i16) -> SpeechSegment {
+        SpeechSegment {
+            samples: vec![sample],
+            reason: SegmentReason::Finish,
+            speech_ms: 1,
+            start_sample: 0,
+            end_sample: 1,
+            audio_start_sample: 0,
+            audio_end_sample: 1,
+        }
+    }
 
     #[test]
-    fn recv_segment_reports_idle_when_timeout_expires() {
+    fn recv_task_reports_idle_when_timeout_expires() {
         let (_tx, rx) = crossbeam_channel::unbounded();
-        let event = recv_segment(&rx, Some(Duration::from_millis(1)));
+        let event = recv_task(&rx, Some(Duration::from_millis(1)));
         assert!(matches!(event, WorkerEvent::Idle));
     }
 
     #[test]
-    fn recv_segment_reports_closed_without_idle_timeout() {
+    fn recv_task_reports_closed_without_idle_timeout() {
         let (tx, rx) = crossbeam_channel::unbounded();
         drop(tx);
-        let event = recv_segment(&rx, None);
+        let event = recv_task(&rx, None);
         assert!(matches!(event, WorkerEvent::Closed));
+    }
+
+    #[test]
+    fn live_stream_input_keeps_consecutive_streams_separate() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(TranscriptionTask::StreamAudio(vec![2])).unwrap();
+        tx.send(TranscriptionTask::StreamFinish(segment(3))).unwrap();
+        tx.send(TranscriptionTask::StreamStart(vec![4])).unwrap();
+
+        let mut input = LiveStreamInput::new(&rx, vec![1]);
+        let mut buffer = Vec::new();
+        assert!(input.read(&mut buffer).unwrap());
+        assert!(input.read(&mut buffer).unwrap());
+        assert!(!input.read(&mut buffer).unwrap());
+        assert_eq!(buffer, vec![1, 2]);
+        assert_eq!(input.finish().unwrap().samples, vec![3]);
+        assert!(matches!(
+            rx.recv().unwrap(),
+            TranscriptionTask::StreamStart(samples) if samples == vec![4]
+        ));
+    }
+
+    #[test]
+    fn drain_stream_finish_stops_before_the_next_task() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(TranscriptionTask::StreamAudio(vec![1])).unwrap();
+        tx.send(TranscriptionTask::StreamFinish(segment(2))).unwrap();
+        tx.send(TranscriptionTask::Segment(segment(3))).unwrap();
+
+        assert_eq!(drain_stream_finish(&rx).unwrap().samples, vec![2]);
+        assert!(matches!(
+            rx.recv().unwrap(),
+            TranscriptionTask::Segment(segment) if segment.samples == vec![3]
+        ));
+    }
+
+    #[test]
+    fn live_stream_input_reports_a_closed_channel() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut input = LiveStreamInput::new(&rx, vec![1]);
+        let mut buffer = Vec::new();
+        assert!(input.read(&mut buffer).unwrap());
+        drop(tx);
+        assert!(input.read(&mut buffer).is_err());
     }
 
 }

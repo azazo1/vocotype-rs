@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow};
 
-use crate::overlay::{OverlayMode, OverlayState};
+use crate::overlay::{OverlayMode, OverlayState, StreamingTranscript};
 
 pub(super) type SharedRuntimeState = Arc<Mutex<RuntimeState>>;
 
@@ -73,6 +73,23 @@ pub(super) fn overlay_state_with_lines(
     transcript_lines: Vec<String>,
 ) -> OverlayState {
     OverlayState::with_transcript(mode, transcript_lines)
+}
+
+pub(super) fn streaming_overlay_state(
+    state: &SharedRuntimeState,
+    stable: String,
+    unstable: String,
+    revision: bool,
+) -> OverlayState {
+    let transcript_lines = state
+        .lock()
+        .map(|guard| guard.transcript_lines.clone())
+        .unwrap_or_default();
+    OverlayState::with_streaming(
+        OverlayMode::Streaming { revision },
+        transcript_lines,
+        StreamingTranscript { stable, unstable },
+    )
 }
 
 pub(super) fn final_mode(remaining: usize) -> OverlayMode {

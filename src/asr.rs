@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::cell::Cell;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -30,6 +31,15 @@ pub struct TranscriptionResult {
     pub inference_latency: f32,
     pub confidence: f32,
     pub error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TranscriptionUpdate {
+    pub result: TranscriptionResult,
+    pub revision: bool,
+    pub revision_count: usize,
+    pub sequence: usize,
+    pub final_result: bool,
 }
 
 impl TranscriptionResult {
@@ -108,11 +118,12 @@ impl AsrEngine {
                 let files = store.iflytek_model_files()?;
                 let runtime = iflytek_runtime::EdgeEsrRuntime::load(
                     files,
-                    iflytek_runtime::EdgeEsrOptions {
+                    iflytek_runtime::EdgeEsrRuntimeOptions {
                         postprocess: iflytek_core::PostprocessOptions {
                             english_punctuation: options.english_punctuation,
                             strip_trailing_period: options.strip_trailing_period,
                         },
+                        ..iflytek_runtime::EdgeEsrRuntimeOptions::default()
                     },
                 )?;
                 info!(
@@ -136,7 +147,22 @@ impl AsrEngine {
         self.transcribe_pcm(&pcm)
     }
 
+    pub fn supports_streaming(&self) -> bool {
+        matches!(&self.backend, BackendEngine::Iflytek(_))
+    }
+
     pub fn transcribe_pcm(&self, audio: &PcmAudio) -> Result<TranscriptionResult> {
+        self.transcribe_pcm_streaming(audio, |_| Ok(()))
+    }
+
+    pub fn transcribe_pcm_streaming<Emit>(
+        &self,
+        audio: &PcmAudio,
+        mut emit: Emit,
+    ) -> Result<TranscriptionResult>
+    where
+        Emit: FnMut(TranscriptionUpdate) -> Result<()>,
+    {
         let start = Instant::now();
         if audio.samples.is_empty() {
             bail!("音频为空, 跳过转写");
@@ -147,7 +173,7 @@ impl AsrEngine {
         } else {
             crate::wav::resample_linear_i16(&audio.samples, audio.sample_rate, TARGET_SAMPLE_RATE)
         };
-        let decoded = match &self.backend {
+        match &self.backend {
             BackendEngine::Sherpa { recognizer, .. } => {
                 let samples = i16_to_f32(&samples_i16);
                 let stream = recognizer.create_stream();
@@ -156,30 +182,151 @@ impl AsrEngine {
                 let result = stream
                     .get_result()
                     .ok_or_else(|| anyhow!("ASR 解码没有返回结果"))?;
-                DecodedResult {
-                    raw_text: result.text.trim().to_string(),
-                    tokens: result.tokens,
-                    token_timestamps: result.timestamps,
-                    confidence: 1.0,
-                }
+                let result = self.build_result(
+                    audio.duration_seconds(),
+                    start.elapsed().as_secs_f32(),
+                    DecodedResult {
+                        raw_text: result.text.trim().to_string(),
+                        tokens: result.tokens,
+                        token_timestamps: result.timestamps,
+                        confidence: 1.0,
+                    },
+                    true,
+                );
+                emit(TranscriptionUpdate {
+                    result: result.clone(),
+                    revision: false,
+                    revision_count: 0,
+                    sequence: 1,
+                    final_result: true,
+                })?;
+                Ok(result)
             }
             BackendEngine::Iflytek(runtime) => {
-                let result = runtime.transcribe_pcm(&samples_i16, TARGET_SAMPLE_RATE)?;
-                DecodedResult {
-                    raw_text: result.text.trim().to_string(),
-                    tokens: result.tokens,
-                    token_timestamps: result.token_timestamps,
-                    confidence: result.confidence,
-                }
+                let mut cursor = 0;
+                let mut final_result = None;
+                let mut last_text = String::new();
+                let mut revision_count = 0;
+                runtime.transcribe_streaming_pcm(
+                    TARGET_SAMPLE_RATE,
+                    |buffer| {
+                        if cursor >= samples_i16.len() {
+                            return Ok(false);
+                        }
+                        let end = (cursor + TARGET_SAMPLE_RATE as usize * 64 / 100)
+                            .min(samples_i16.len());
+                        buffer.extend_from_slice(&samples_i16[cursor..end]);
+                        cursor = end;
+                        Ok(cursor < samples_i16.len())
+                    },
+                    |update| {
+                        let result = self.build_result(
+                            audio.duration_seconds(),
+                            start.elapsed().as_secs_f32(),
+                            DecodedResult {
+                                raw_text: update.transcription.text.trim().to_string(),
+                                tokens: update.transcription.tokens,
+                                token_timestamps: update.transcription.token_timestamps,
+                                confidence: update.transcription.confidence,
+                            },
+                            update.final_result,
+                        );
+                        let revision = update.revision
+                            || (!last_text.is_empty() && !result.text.starts_with(&last_text));
+                        if revision {
+                            revision_count += 1;
+                        }
+                        if !result.text.is_empty() {
+                            last_text = result.text.clone();
+                        }
+                        if update.final_result {
+                            final_result = Some(result.clone());
+                        }
+                        emit(TranscriptionUpdate {
+                            result,
+                            revision,
+                            revision_count,
+                            sequence: update.sequence,
+                            final_result: update.final_result,
+                        })
+                    },
+                )?;
+                final_result.ok_or_else(|| anyhow!("EdgeEsr 流式解码没有返回 final"))
             }
+        }
+    }
+
+    pub fn transcribe_live_pcm<Read, Emit>(
+        &self,
+        mut read: Read,
+        mut emit: Emit,
+    ) -> Result<TranscriptionResult>
+    where
+        Read: FnMut(&mut Vec<i16>) -> Result<bool>,
+        Emit: FnMut(TranscriptionUpdate) -> Result<()>,
+    {
+        let BackendEngine::Iflytek(runtime) = &self.backend else {
+            bail!("当前 ASR 后端不支持实时流式输入");
         };
+        let start = Instant::now();
+        let input_samples = Cell::new(0usize);
+        let mut final_result = None;
+        let mut last_text = String::new();
+        let mut revision_count = 0;
+        runtime.transcribe_streaming_pcm(
+            TARGET_SAMPLE_RATE,
+            |buffer| {
+                let previous_len = buffer.len();
+                let has_more = read(buffer)?;
+                input_samples.set(input_samples.get() + buffer.len() - previous_len);
+                Ok(has_more)
+            },
+            |update| {
+                let duration = input_samples.get() as f32 / TARGET_SAMPLE_RATE as f32;
+                let result = self.build_result(
+                    duration,
+                    start.elapsed().as_secs_f32(),
+                    DecodedResult {
+                        raw_text: update.transcription.text.trim().to_string(),
+                        tokens: update.transcription.tokens,
+                        token_timestamps: update.transcription.token_timestamps,
+                        confidence: update.transcription.confidence,
+                    },
+                    update.final_result,
+                );
+                let revision = update.revision
+                    || (!last_text.is_empty() && !result.text.starts_with(&last_text));
+                if revision {
+                    revision_count += 1;
+                }
+                if !result.text.is_empty() {
+                    last_text = result.text.clone();
+                }
+                if update.final_result {
+                    final_result = Some(result.clone());
+                }
+                emit(TranscriptionUpdate {
+                    result,
+                    revision,
+                    revision_count,
+                    sequence: update.sequence,
+                    final_result: update.final_result,
+                })
+            },
+        )?;
+        final_result.ok_or_else(|| anyhow!("EdgeEsr 实时流式解码没有返回 final"))
+    }
+
+    fn build_result(
+        &self,
+        duration: f32,
+        latency: f32,
+        decoded: DecodedResult,
+        log_final: bool,
+    ) -> TranscriptionResult {
         let raw_text = decoded.raw_text;
         let tokens = decoded.tokens;
         let token_timestamps = decoded.token_timestamps;
-        let latency = start.elapsed().as_secs_f32();
-        let duration = audio.duration_seconds();
-        let duration_label = format!("{:.2}", duration);
-        let latency_label = format!("{:.2}", latency);
         let success = !raw_text.is_empty();
         let text = if success {
             let punctuated = self.restore_punctuation(&raw_text);
@@ -195,23 +342,27 @@ impl AsrEngine {
         } else {
             raw_text.clone()
         };
-        if success {
-            info!(
-                duration = %duration_label,
-                latency = %latency_label,
-                chars = raw_text.chars().count(),
-                text = %text,
-                "ASR 转写完成"
-            );
-        } else {
-            debug!(
-                duration = %duration_label,
-                latency = %latency_label,
-                "ASR 没有识别到文本"
-            );
+        if log_final {
+            let duration_label = format!("{:.2}", duration);
+            let latency_label = format!("{:.2}", latency);
+            if success {
+                info!(
+                    duration = %duration_label,
+                    latency = %latency_label,
+                    chars = raw_text.chars().count(),
+                    text = %text,
+                    "ASR 转写完成"
+                );
+            } else {
+                debug!(
+                    duration = %duration_label,
+                    latency = %latency_label,
+                    "ASR 没有识别到文本"
+                );
+            }
         }
 
-        Ok(TranscriptionResult {
+        TranscriptionResult {
             success,
             text: text.clone(),
             raw_text,
@@ -225,7 +376,7 @@ impl AsrEngine {
             } else {
                 Some(EMPTY_TRANSCRIPTION_MESSAGE.to_string())
             },
-        })
+        }
     }
 
     fn restore_punctuation(&self, text: &str) -> String {

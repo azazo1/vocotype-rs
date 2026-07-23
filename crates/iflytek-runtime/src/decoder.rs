@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use iflytek_core::{
@@ -24,6 +25,13 @@ pub(crate) struct DecoderAdvance {
     pub(crate) attention: MemoryAttentionResult,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct DecoderTimings {
+    pub(crate) attention: Duration,
+    pub(crate) onnx: Duration,
+    pub(crate) beam: Duration,
+}
+
 pub(crate) struct EdgeEsrDecoder<'a> {
     decoder1: &'a mut Session,
     decoder2: &'a mut Session,
@@ -40,6 +48,7 @@ pub(crate) struct EdgeEsrDecoder<'a> {
     query: Vec<f32>,
     query_stop: Vec<f32>,
     done: bool,
+    timings: DecoderTimings,
 }
 
 impl<'a> EdgeEsrDecoder<'a> {
@@ -67,6 +76,7 @@ impl<'a> EdgeEsrDecoder<'a> {
             query: vec![0.0; MAX_BEAMS * HIDDEN_SIZE],
             query_stop: vec![0.0; MAX_BEAMS * HIDDEN_SIZE],
             done: false,
+            timings: DecoderTimings::default(),
         };
         runtime.labels[0] = START_TOKEN_ID;
         runtime.run_decoder1()?;
@@ -82,6 +92,7 @@ impl<'a> EdgeEsrDecoder<'a> {
             bail!("EdgeEsr decoder is already complete")
         }
         let active_before = self.active_count;
+        let attention_started = Instant::now();
         let attention = self.attention.step(MemoryAttentionInput {
             conformer_output: &bank.conformer_output,
             at_h: &bank.at_h,
@@ -96,6 +107,7 @@ impl<'a> EdgeEsrDecoder<'a> {
             lengths: &self.lengths[..active_before],
             final_flush,
         })?;
+        self.timings.attention += attention_started.elapsed();
         if !attention.ready {
             return Ok(DecoderAdvance { attention });
         }
@@ -127,7 +139,9 @@ impl<'a> EdgeEsrDecoder<'a> {
             inputs.push((name, state.into_value()?));
         }
         self.active_rows.set(active_before as i32)?;
+        let decoder_started = Instant::now();
         let outputs = self.decoder2.run(inputs)?;
+        self.timings.onnx += decoder_started.elapsed();
         let (score_shape, scores) = output_f32(&outputs["score"], "score")?;
         if score_shape != [MAX_BEAMS, BeamSearchConfig::default().input_score_count] {
             bail!("decoder part 2 score shape does not match EdgeEsr contract")
@@ -141,11 +155,13 @@ impl<'a> EdgeEsrDecoder<'a> {
             );
         }
         drop(outputs);
+        let beam_started = Instant::now();
         let search = self.search.step(
             &scores[..active_before * BeamSearchConfig::default().input_score_count],
             &postproc_flags[..active_before],
             FRAME_BUDGET,
         )?;
+        self.timings.beam += beam_started.elapsed();
         let parents = search.parent_indices();
         let active_after = search.candidates.len();
         if active_after == 0 {
@@ -173,6 +189,10 @@ impl<'a> EdgeEsrDecoder<'a> {
         &self.search
     }
 
+    pub(crate) fn timings(&self) -> DecoderTimings {
+        self.timings
+    }
+
     fn run_decoder1(&mut self) -> Result<()> {
         let mut inputs = Vec::with_capacity(5);
         inputs.push((
@@ -187,7 +207,9 @@ impl<'a> EdgeEsrDecoder<'a> {
             inputs.push((name, state.into_value()?));
         }
         self.active_rows.set(self.active_count as i32)?;
+        let decoder_started = Instant::now();
         let outputs = self.decoder1.run(inputs)?;
+        self.timings.onnx += decoder_started.elapsed();
         self.lm = output_f32(&outputs["lm"], "lm")?.1;
         self.query = output_f32(&outputs["lm_att_p2s"], "lm_att_p2s")?.1;
         self.query_stop = output_f32(&outputs["lm_att_p2s_stop"], "lm_att_p2s_stop")?.1;

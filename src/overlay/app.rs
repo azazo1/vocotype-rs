@@ -3,14 +3,12 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
 
-use super::platform;
+use super::{OVERLAY_WIDTH, platform};
 use super::state::{OverlayMode, OverlayState};
 
 const REPAINT_INTERVAL: Duration = Duration::from_millis(80);
 const DONE_VISIBLE_FOR: Duration = Duration::from_millis(1_400);
 const ERROR_HIDE_AFTER_LEAVE: Duration = Duration::from_millis(700);
-const MIN_WIDTH: f32 = 360.0;
-const MAX_WIDTH: f32 = 560.0;
 const BASE_HEIGHT: f32 = 108.0;
 const MAX_HEIGHT: f32 = 420.0;
 const TEXT_LINE_HEIGHT: f32 = 21.0;
@@ -224,7 +222,7 @@ fn draw_status(ui: &mut egui::Ui, state: &OverlayState) {
 }
 
 fn draw_transcript(ui: &mut egui::Ui, state: &OverlayState) {
-    if state.transcript_lines.is_empty() {
+    if state.transcript_lines.is_empty() && state.streaming.is_none() {
         return;
     }
 
@@ -239,6 +237,24 @@ fn draw_transcript(ui: &mut egui::Ui, state: &OverlayState) {
             .wrap(),
         );
     }
+    if let Some(streaming) = &state.streaming {
+        ui.horizontal_wrapped(|ui| {
+            if !streaming.stable.is_empty() {
+                ui.label(
+                    egui::RichText::new(&streaming.stable)
+                        .size(15.0)
+                        .color(egui::Color32::from_rgb(235, 238, 242)),
+                );
+            }
+            if !streaming.unstable.is_empty() {
+                ui.label(
+                    egui::RichText::new(&streaming.unstable)
+                        .size(15.0)
+                        .color(egui::Color32::from_rgb(145, 154, 166)),
+                );
+            }
+        });
+    }
 }
 
 fn overlay_size(state: &OverlayState) -> egui::Vec2 {
@@ -247,17 +263,23 @@ fn overlay_size(state: &OverlayState) -> egui::Vec2 {
         .iter()
         .map(|line| visual_line_count(line))
         .sum::<usize>();
+    let streaming_lines = state
+        .streaming
+        .as_ref()
+        .map(|streaming| {
+            visual_line_count(&format!("{}{}", streaming.stable, streaming.unstable))
+        })
+        .unwrap_or(0);
+    let wrapped_lines = wrapped_lines + streaming_lines;
     let text_height = if wrapped_lines == 0 {
         0.0
     } else {
         18.0 + wrapped_lines as f32 * TEXT_LINE_HEIGHT
     };
-    let width = if wrapped_lines == 0 {
-        MIN_WIDTH
-    } else {
-        MAX_WIDTH
-    };
-    egui::vec2(width, (BASE_HEIGHT + text_height).min(MAX_HEIGHT))
+    egui::vec2(
+        OVERLAY_WIDTH,
+        (BASE_HEIGHT + text_height).min(MAX_HEIGHT),
+    )
 }
 
 fn overlay_position(screen_rect: platform::ScreenRect, size: egui::Vec2) -> egui::Pos2 {
@@ -271,4 +293,26 @@ fn overlay_position(screen_rect: platform::ScreenRect, size: egui::Vec2) -> egui
 fn visual_line_count(text: &str) -> usize {
     let chars = text.chars().count().max(1);
     chars.div_ceil(TEXT_CHARS_PER_LINE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::overlay::StreamingTranscript;
+
+    #[test]
+    fn overlay_width_stays_fixed_when_streaming_text_changes() {
+        let idle = OverlayState::new(OverlayMode::Recording { level: 0.0 });
+        let streaming = OverlayState::with_streaming(
+            OverlayMode::Streaming { revision: false },
+            Vec::new(),
+            StreamingTranscript {
+                stable: "这是一个".to_string(),
+                unstable: "实时流式转写结果".to_string(),
+            },
+        );
+
+        assert_eq!(overlay_size(&idle).x, OVERLAY_WIDTH);
+        assert_eq!(overlay_size(&streaming).x, OVERLAY_WIDTH);
+    }
 }

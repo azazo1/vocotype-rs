@@ -10,8 +10,8 @@ use iflytek_core::{
 };
 use ndarray::ArrayD;
 use ndarray_npy::NpzReader;
-use ort::session::Session;
-use tracing::info;
+use ort::session::{Session, builder::SessionBuilder};
+use tracing::{debug, info, trace};
 
 mod decoder;
 mod encoder;
@@ -130,9 +130,28 @@ pub struct EdgeEsrTranscription {
     pub confidence: f32,
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct EdgeEsrOptions {
+#[derive(Clone, Debug)]
+pub struct EdgeEsrStreamUpdate {
+    pub transcription: EdgeEsrTranscription,
+    pub revision: bool,
+    pub revision_count: usize,
+    pub sequence: usize,
+    pub final_result: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct EdgeEsrRuntimeOptions {
     pub postprocess: PostprocessOptions,
+    pub intra_threads: usize,
+}
+
+impl Default for EdgeEsrRuntimeOptions {
+    fn default() -> Self {
+        Self {
+            postprocess: PostprocessOptions::default(),
+            intra_threads: default_intra_threads(),
+        }
+    }
 }
 
 struct EdgeEsrSessions {
@@ -140,6 +159,15 @@ struct EdgeEsrSessions {
     conformer_encoder: Mutex<Session>,
     decoder_part1: Mutex<Session>,
     decoder_part2: Mutex<Session>,
+}
+
+#[derive(Default)]
+struct StreamEmissionState {
+    last_token_ids: Vec<i32>,
+    last_text: String,
+    partial_count: usize,
+    revision_count: usize,
+    postprocess_elapsed: std::time::Duration,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -167,7 +195,10 @@ pub struct EdgeEsrRuntime {
 }
 
 impl EdgeEsrRuntime {
-    pub fn load(files: EdgeEsrModelFiles, options: EdgeEsrOptions) -> Result<Arc<Self>> {
+    pub fn load(files: EdgeEsrModelFiles, options: EdgeEsrRuntimeOptions) -> Result<Arc<Self>> {
+        if options.intra_threads == 0 {
+            bail!("EdgeEsr intra-op thread count must be positive")
+        }
         let started = std::time::Instant::now();
         init_onnx_runtime_api()?;
         let active_rows = DecoderActiveRows::load()?;
@@ -183,12 +214,26 @@ impl EdgeEsrRuntime {
         )?;
         let attention_weights = Arc::new(load_attention_weights(&files.attention_weights)?);
         let vocabulary = Arc::new(load_vocabulary(&files.tokens)?);
-        info!(path = %files.root.display(), "loading EdgeEsr model files");
+        info!(
+            path = %files.root.display(),
+            intra_threads = options.intra_threads,
+            kernel_backend = iflytek_core::optimized_kernel_backend(),
+            "loading EdgeEsr model files"
+        );
         let sessions = Arc::new(EdgeEsrSessions {
-            vgg_encoder: Mutex::new(load_session(&files.vgg_encoder)?),
-            conformer_encoder: Mutex::new(load_session(&files.conformer_encoder)?),
-            decoder_part1: Mutex::new(load_session(&files.decoder_part1)?),
-            decoder_part2: Mutex::new(load_session(&files.decoder_part2)?),
+            vgg_encoder: Mutex::new(load_session(&files.vgg_encoder, options.intra_threads)?),
+            conformer_encoder: Mutex::new(load_session(
+                &files.conformer_encoder,
+                options.intra_threads,
+            )?),
+            decoder_part1: Mutex::new(load_session(
+                &files.decoder_part1,
+                options.intra_threads,
+            )?),
+            decoder_part2: Mutex::new(load_session(
+                &files.decoder_part2,
+                options.intra_threads,
+            )?),
         });
         let runtime = Arc::new(Self {
             files,
@@ -240,11 +285,34 @@ impl EdgeEsrRuntime {
         samples: &[i16],
         sample_rate: u32,
     ) -> Result<EdgeEsrTranscription> {
+        let mut cursor = 0;
+        self.transcribe_streaming_pcm(
+            sample_rate,
+            |buffer| {
+                if cursor >= samples.len() {
+                    return Ok(false);
+                }
+                let end = (cursor + STREAM_ACCEPT_SAMPLES).min(samples.len());
+                buffer.extend_from_slice(&samples[cursor..end]);
+                cursor = end;
+                Ok(cursor < samples.len())
+            },
+            |_| Ok(()),
+        )
+    }
+
+    pub fn transcribe_streaming_pcm<Read, Emit>(
+        &self,
+        sample_rate: u32,
+        mut read: Read,
+        mut emit: Emit,
+    ) -> Result<EdgeEsrTranscription>
+    where
+        Read: FnMut(&mut Vec<i16>) -> Result<bool>,
+        Emit: FnMut(EdgeEsrStreamUpdate) -> Result<()>,
+    {
         if sample_rate as usize != SAMPLE_RATE {
             bail!("EdgeEsr ASR requires a 16000 Hz sample rate")
-        }
-        if samples.is_empty() {
-            bail!("EdgeEsr ASR input is empty")
         }
         let started = std::time::Instant::now();
         let _decoder_guard = self.decoder_guard()?;
@@ -266,9 +334,151 @@ impl EdgeEsrRuntime {
         )?;
         let mut recognizer = recognizer::EdgeEsrRecognizer::new(encoder, decoder);
         let startup_chunks = recognizer.prime_encoder()?;
-        recognizer.accept_pcm(samples, false)?;
+        let mut pending = Vec::with_capacity(STREAM_ACCEPT_SAMPLES * 2);
+        let mut pending_cursor = 0;
+        let mut input_samples = 0;
+        let mut emission = StreamEmissionState::default();
+
+        loop {
+            if pending_cursor > 0 {
+                pending.drain(..pending_cursor);
+                pending_cursor = 0;
+            }
+            let previous_len = pending.len();
+            let has_more = read(&mut pending)?;
+            if pending.len() < previous_len {
+                bail!("EdgeEsr streaming input reader removed pending samples")
+            }
+            input_samples += pending.len() - previous_len;
+            while pending.len().saturating_sub(pending_cursor) >= STREAM_ACCEPT_SAMPLES {
+                let chunk_started = std::time::Instant::now();
+                recognizer.accept_pcm(
+                    &pending[pending_cursor..pending_cursor + STREAM_ACCEPT_SAMPLES],
+                    false,
+                )?;
+                pending_cursor += STREAM_ACCEPT_SAMPLES;
+                trace!(
+                    elapsed_us = chunk_started.elapsed().as_micros(),
+                    accepted_samples = STREAM_ACCEPT_SAMPLES,
+                    "EdgeEsr streaming chunk accepted"
+                );
+                self.emit_partial_update(
+                    &recognizer,
+                    &mut emission,
+                    &mut emit,
+                )?;
+            }
+            if !has_more {
+                break;
+            }
+        }
+        if input_samples == 0 {
+            bail!("EdgeEsr ASR input is empty")
+        }
+        if pending_cursor < pending.len() {
+            recognizer.accept_pcm(&pending[pending_cursor..], false)?;
+            self.emit_partial_update(
+                &recognizer,
+                &mut emission,
+                &mut emit,
+            )?;
+        }
         recognizer.accept_pcm(&vec![0; SAMPLE_RATE * 4 / 5], true)?;
+        let timings = recognizer.timings();
+        let postprocess_started = std::time::Instant::now();
+        let transcription = self.recognizer_transcription(&recognizer, true)?;
+        emission.postprocess_elapsed += postprocess_started.elapsed();
+        let revision = !emission.last_text.is_empty()
+            && !transcription.text.starts_with(&emission.last_text);
+        if revision {
+            emission.revision_count += 1;
+        }
+        emit(EdgeEsrStreamUpdate {
+            transcription: transcription.clone(),
+            revision,
+            revision_count: emission.revision_count,
+            sequence: emission.partial_count + 1,
+            final_result: true,
+        })?;
+        info!(
+            elapsed_ms = started.elapsed().as_millis(),
+            encoder_ms = timings.encoder.as_millis(),
+            decoder_ms = timings.decoder.as_millis(),
+            attention_ms = timings.attention.as_millis(),
+            beam_ms = timings.beam.as_millis(),
+            postprocess_ms = emission.postprocess_elapsed.as_millis(),
+            startup_chunks,
+            partial_count = emission.partial_count,
+            revision_count = emission.revision_count,
+            token_count = transcription.tokens.len(),
+            "EdgeEsr transcription completed"
+        );
+        Ok(transcription)
+    }
+
+    fn emit_partial_update<Emit>(
+        &self,
+        recognizer: &recognizer::EdgeEsrRecognizer<'_>,
+        emission: &mut StreamEmissionState,
+        emit: &mut Emit,
+    ) -> Result<()>
+    where
+        Emit: FnMut(EdgeEsrStreamUpdate) -> Result<()>,
+    {
+        let Some((path, _)) = recognizer.best_path() else {
+            return Ok(());
+        };
+        if path == emission.last_token_ids.as_slice() {
+            return Ok(());
+        }
+        emission.last_token_ids.clear();
+        emission.last_token_ids.extend_from_slice(path);
+        let started = std::time::Instant::now();
+        let transcription = self.recognizer_transcription(recognizer, false)?;
+        emission.postprocess_elapsed += started.elapsed();
+        if transcription.text.is_empty() || transcription.text == emission.last_text {
+            return Ok(());
+        }
+        let revision = !emission.last_text.is_empty()
+            && !transcription.text.starts_with(emission.last_text.as_str());
+        if revision {
+            emission.revision_count += 1;
+        }
+        emission.partial_count += 1;
+        debug!(
+            sequence = emission.partial_count,
+            revision,
+            revision_count = emission.revision_count,
+            text = %transcription.text,
+            "EdgeEsr partial transcription updated"
+        );
+        emission.last_text = transcription.text.clone();
+        emit(EdgeEsrStreamUpdate {
+            transcription,
+            revision,
+            revision_count: emission.revision_count,
+            sequence: emission.partial_count,
+            final_result: false,
+        })
+    }
+
+    fn recognizer_transcription(
+        &self,
+        recognizer: &recognizer::EdgeEsrRecognizer<'_>,
+        final_result: bool,
+    ) -> Result<EdgeEsrTranscription> {
         let (path, normalized_score) = recognizer.best_path().unwrap_or((&[], -20_000.0));
+        let tokens = self.tokens_from_path(path);
+        let processed = self.postprocessor.process(&tokens, final_result)?;
+        Ok(EdgeEsrTranscription {
+            text: processed.text,
+            tokens: processed.tokens,
+            token_timestamps: None,
+            confidence: normalized_score.exp().clamp(0.0, 1.0),
+        })
+    }
+
+    fn tokens_from_path(&self, path: &[i32]) -> Vec<String> {
         let mut raw_tokens = Vec::new();
         for token in path {
             let token_id = *token - 1;
@@ -287,22 +497,11 @@ impl EdgeEsrRuntime {
                 raw_tokens.push(token);
             }
         }
-        let tokens = merge_bpe_continuations(raw_tokens);
-        let processed = self.postprocessor.process(&tokens, true)?;
-        info!(
-            elapsed_ms = started.elapsed().as_millis(),
-            startup_chunks,
-            token_count = processed.tokens.len(),
-            "EdgeEsr transcription completed"
-        );
-        Ok(EdgeEsrTranscription {
-            text: processed.text,
-            tokens: processed.tokens,
-            token_timestamps: None,
-            confidence: normalized_score.exp().clamp(0.0, 1.0),
-        })
+        merge_bpe_continuations(raw_tokens)
     }
 }
+
+const STREAM_ACCEPT_SAMPLES: usize = SAMPLE_RATE * 64 / 100;
 
 fn merge_bpe_continuations(tokens: Vec<String>) -> Vec<String> {
     let mut merged: Vec<String> = Vec::new();
@@ -362,11 +561,8 @@ fn load_vocabulary(path: &Path) -> Result<Vec<String>> {
     Ok(vocabulary)
 }
 
-fn load_session(path: &Path) -> Result<Session> {
-    Session::builder()
-        .map_err(|error| anyhow::anyhow!("unable to create ONNX session builder: {}", error))?
-        .with_intra_threads(1)
-        .map_err(|error| anyhow::anyhow!("unable to configure ONNX session: {}", error))?
+fn load_session(path: &Path, intra_threads: usize) -> Result<Session> {
+    configured_session_builder(intra_threads)?
         .with_operators(iflytek_ops::operator_domain().map_err(|error| {
             anyhow::anyhow!(
                 "unable to create {} custom-op domain: {}",
@@ -379,14 +575,37 @@ fn load_session(path: &Path) -> Result<Session> {
         .map_err(|error| anyhow::anyhow!("unable to load ONNX model {}: {}", path.display(), error))
 }
 
-fn load_plain_session(path: &Path) -> Result<Session> {
-    let mut builder = Session::builder()
-        .map_err(|error| anyhow::anyhow!("unable to create ONNX session builder: {}", error))?
-        .with_intra_threads(1)
-        .map_err(|error| anyhow::anyhow!("unable to configure ONNX session: {}", error))?;
+fn load_plain_session(path: &Path, intra_threads: usize) -> Result<Session> {
+    let mut builder = configured_session_builder(intra_threads)?;
     builder
         .commit_from_file(path)
         .map_err(|error| anyhow::anyhow!("unable to load ONNX model {}: {}", path.display(), error))
+}
+
+fn configured_session_builder(intra_threads: usize) -> Result<SessionBuilder> {
+    let builder = Session::builder()
+        .map_err(|error| anyhow::anyhow!("unable to create ONNX session builder: {}", error))?;
+    let builder = builder
+        .with_intra_threads(intra_threads)
+        .map_err(|error| anyhow::anyhow!("unable to configure intra-op threads: {}", error))?;
+    let builder = builder
+        .with_inter_threads(1)
+        .map_err(|error| anyhow::anyhow!("unable to configure inter-op threads: {}", error))?;
+    let builder = builder
+        .with_parallel_execution(false)
+        .map_err(|error| anyhow::anyhow!("unable to configure sequential execution: {}", error))?;
+    let builder = builder
+        .with_config_entry("session.intra_op.allow_spinning", "0")
+        .map_err(|error| anyhow::anyhow!("unable to disable intra-op spinning: {}", error))?;
+    builder
+        .with_config_entry("session.inter_op.allow_spinning", "0")
+        .map_err(|error| anyhow::anyhow!("unable to disable inter-op spinning: {}", error))
+}
+
+fn default_intra_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|threads| threads.get().min(4))
+        .unwrap_or(1)
 }
 
 fn session_inputs(session: &Mutex<Session>) -> Result<Vec<String>> {

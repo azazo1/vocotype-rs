@@ -4,22 +4,25 @@ use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use tracing::{debug, info, warn};
 
+use crate::asr::TARGET_SAMPLE_RATE;
+use crate::asr_backend::AsrBackend;
 use crate::audio::AudioInput;
 use crate::dataset::DatasetRecorder;
 use crate::hotkey::{HotkeyAction, HotkeyEvent, HotkeyManager, HotkeyMatcher, HotkeyRole};
 use crate::models::ModelStore;
 use crate::overlay::{OverlayHandle, OverlayMode};
-use crate::vad::{SpeechSegment, VadSegmenter};
+use crate::vad::{SegmentReason, SpeechSegment, VadSegmenter};
 
 use super::{DaemonOptions, HotkeyMode};
 use super::segments::{
-    build_segmenter, drain_release_tail, frame_level, submit_segment,
+    build_segmenter, frame_level, submit_segment, submit_stream_audio, submit_stream_finish,
+    submit_stream_start,
 };
 use super::state::{
     SharedRuntimeState, begin_recording_session, end_recording_session, new_state, overlay_state,
     pending_count,
 };
-use super::worker::{TranscriptionWorkerConfig, transcription_worker};
+use super::worker::{TranscriptionTask, TranscriptionWorkerConfig, transcription_worker};
 
 pub(super) fn run_daemon_loop(
     store: ModelStore,
@@ -40,7 +43,7 @@ pub(super) fn run_daemon_loop(
 
     let state = new_state();
 
-    let (segment_tx, segment_rx) = crossbeam_channel::unbounded();
+    let (task_tx, task_rx) = crossbeam_channel::unbounded();
     let overlay_worker = overlay.clone();
     let state_worker = state.clone();
     let inject_method = options.inject_method.clone();
@@ -59,12 +62,12 @@ pub(super) fn run_daemon_loop(
                 idle_unload_secs,
                 asr_options,
             },
-            segment_rx,
+            task_rx,
         );
     });
 
     let hotkey_events = HotkeyManager::events().clone();
-    let mut capture = CaptureRuntime::new();
+    let mut capture = CaptureRuntime::new(options.asr_options.backend == AsrBackend::Iflytek);
 
     info!(
         hotkey_mode = options.hotkey_mode.label(),
@@ -84,7 +87,7 @@ pub(super) fn run_daemon_loop(
                         &mut HotkeyRuntime {
                             capture: &mut capture,
                             segmenter: &mut segmenter,
-                            segment_tx: &segment_tx,
+                            task_tx: &task_tx,
                             state: &state,
                             overlay: &overlay,
                             tail_padding_ms: options.tail_padding_ms,
@@ -93,24 +96,24 @@ pub(super) fn run_daemon_loop(
                 }
             }
             default(Duration::from_millis(30)) => {
-                if capture.capturing && let Some(rx) = &capture.audio_rx {
+                if capture.capturing && let Some(rx) = capture.audio_rx.clone() {
                     match rx.recv_timeout(Duration::from_millis(10)) {
                         Ok(frame) => {
                             process_audio_frame(
                                 frame,
                                 &mut segmenter,
-                                &segment_tx,
+                                &task_tx,
                                 &state,
                                 &overlay,
-                                &mut capture.last_frame_at,
+                                &mut capture,
                             )?;
                             drain_queued_audio_frames(
-                                rx,
+                                &rx,
                                 &mut segmenter,
-                                &segment_tx,
+                                &task_tx,
                                 &state,
                                 &overlay,
-                                &mut capture.last_frame_at,
+                                &mut capture,
                             )?;
                         }
                         Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
@@ -123,12 +126,15 @@ pub(super) fn run_daemon_loop(
                         }
                         Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                             warn!("音频流断开");
-                            capture.capturing = false;
-                            end_recording_session(&state);
-                            if let Some(input) = capture.audio_input.take() {
-                                input.stop();
-                            }
-                            capture.audio_rx = None;
+                            end_capture(
+                                &mut capture,
+                                &mut segmenter,
+                                &task_tx,
+                                &state,
+                                &overlay,
+                                options.tail_padding_ms,
+                                "音频流断开, 结束录音",
+                            )?;
                         }
                     }
                 }
@@ -140,23 +146,58 @@ pub(super) fn run_daemon_loop(
 fn process_audio_frame(
     frame: Vec<i16>,
     segmenter: &mut VadSegmenter,
-    segment_tx: &Sender<SpeechSegment>,
+    task_tx: &Sender<TranscriptionTask>,
     state: &SharedRuntimeState,
     overlay: &OverlayHandle,
-    last_frame_at: &mut Instant,
+    capture: &mut CaptureRuntime,
 ) -> Result<()> {
-    *last_frame_at = Instant::now();
+    capture.last_frame_at = Instant::now();
     let level = frame_level(&frame);
-    let mode = if segmenter.detected() {
-        OverlayMode::Recording { level }
-    } else {
-        OverlayMode::Silence {
-            pending: pending_count(state),
+    if !capture.stream_active {
+        let mode = if segmenter.detected() {
+            OverlayMode::Recording { level }
+        } else {
+            OverlayMode::Silence {
+                pending: pending_count(state),
+            }
+        };
+        overlay.set(overlay_state(state, mode));
+    }
+
+    let was_detected = segmenter.detected();
+    capture.session_audio.extend_from_slice(&frame);
+    let segments = segmenter.push(&frame)?;
+    let detected = segmenter.detected();
+    if capture.streaming_backend {
+        if !was_detected && detected {
+            let start = segmenter
+                .active_audio_start_sample()
+                .unwrap_or_else(|| capture.session_audio.len().saturating_sub(frame.len()))
+                .min(capture.session_audio.len());
+            let started = submit_stream_start(
+                task_tx,
+                state,
+                overlay,
+                capture.session_audio[start..].to_vec(),
+            )?;
+            if started {
+                capture.stream_active = true;
+                capture.stream_start_sample = Some(start);
+            }
+        } else if capture.stream_active {
+            submit_stream_audio(task_tx, frame)?;
         }
-    };
-    overlay.set(overlay_state(state, mode));
-    for segment in segmenter.push(&frame)? {
-        submit_segment(segment_tx, state, overlay, segment)?;
+        for segment in segments {
+            if capture.stream_active {
+                finish_active_stream(task_tx, capture, segment)?;
+            } else {
+                submit_segment(task_tx, state, overlay, segment)?;
+            }
+        }
+    } else {
+        for segment in segments {
+            submit_segment(task_tx, state, overlay, segment)?;
+        }
     }
     Ok(())
 }
@@ -164,15 +205,15 @@ fn process_audio_frame(
 fn drain_queued_audio_frames(
     audio_rx: &Receiver<Vec<i16>>,
     segmenter: &mut VadSegmenter,
-    segment_tx: &Sender<SpeechSegment>,
+    task_tx: &Sender<TranscriptionTask>,
     state: &SharedRuntimeState,
     overlay: &OverlayHandle,
-    last_frame_at: &mut Instant,
+    capture: &mut CaptureRuntime,
 ) -> Result<()> {
     loop {
         match audio_rx.try_recv() {
             Ok(frame) => {
-                process_audio_frame(frame, segmenter, segment_tx, state, overlay, last_frame_at)?
+                process_audio_frame(frame, segmenter, task_tx, state, overlay, capture)?
             }
             Err(TryRecvError::Empty) => return Ok(()),
             Err(TryRecvError::Disconnected) => {
@@ -186,7 +227,7 @@ fn drain_queued_audio_frames(
 struct HotkeyRuntime<'a> {
     capture: &'a mut CaptureRuntime,
     segmenter: &'a mut VadSegmenter,
-    segment_tx: &'a Sender<SpeechSegment>,
+    task_tx: &'a Sender<TranscriptionTask>,
     state: &'a SharedRuntimeState,
     overlay: &'a OverlayHandle,
     tail_padding_ms: u32,
@@ -197,15 +238,23 @@ struct CaptureRuntime {
     audio_input: Option<AudioInput>,
     audio_rx: Option<Receiver<Vec<i16>>>,
     last_frame_at: Instant,
+    streaming_backend: bool,
+    stream_active: bool,
+    stream_start_sample: Option<usize>,
+    session_audio: Vec<i16>,
 }
 
 impl CaptureRuntime {
-    fn new() -> Self {
+    fn new(streaming_backend: bool) -> Self {
         Self {
             capturing: false,
             audio_input: None,
             audio_rx: None,
             last_frame_at: Instant::now(),
+            streaming_backend,
+            stream_active: false,
+            stream_start_sample: None,
+            session_audio: Vec::new(),
         }
     }
 }
@@ -227,7 +276,7 @@ fn handle_hotkey_event(
             } => end_capture(
                 ctx.capture,
                 ctx.segmenter,
-                ctx.segment_tx,
+                ctx.task_tx,
                 ctx.state,
                 ctx.overlay,
                 ctx.tail_padding_ms,
@@ -242,7 +291,7 @@ fn handle_hotkey_event(
             } if ctx.capture.capturing => end_capture(
                 ctx.capture,
                 ctx.segmenter,
-                ctx.segment_tx,
+                ctx.task_tx,
                 ctx.state,
                 ctx.overlay,
                 ctx.tail_padding_ms,
@@ -265,7 +314,7 @@ fn handle_hotkey_event(
             } => end_capture(
                 ctx.capture,
                 ctx.segmenter,
-                ctx.segment_tx,
+                ctx.task_tx,
                 ctx.state,
                 ctx.overlay,
                 ctx.tail_padding_ms,
@@ -290,6 +339,9 @@ fn begin_capture(
     capture.audio_rx = Some(input.receiver());
     capture.audio_input = Some(input);
     segmenter.reset();
+    capture.stream_active = false;
+    capture.stream_start_sample = None;
+    capture.session_audio.clear();
     capture.capturing = true;
     capture.last_frame_at = Instant::now();
     begin_recording_session(state);
@@ -300,7 +352,7 @@ fn begin_capture(
 fn end_capture(
     capture: &mut CaptureRuntime,
     segmenter: &mut VadSegmenter,
-    segment_tx: &Sender<SpeechSegment>,
+    task_tx: &Sender<TranscriptionTask>,
     state: &SharedRuntimeState,
     overlay: &OverlayHandle,
     tail_padding_ms: u32,
@@ -312,18 +364,34 @@ fn end_capture(
     debug!("{}", reason);
     capture.capturing = false;
     end_recording_session(state);
-    if let Some(rx) = &capture.audio_rx {
-        drain_release_tail(
-            rx,
-            segmenter,
-            segment_tx,
-            state,
-            overlay,
-            Duration::from_millis(tail_padding_ms as u64),
-        )?;
+    if let Some(rx) = capture.audio_rx.clone() {
+        let deadline = Instant::now() + Duration::from_millis(tail_padding_ms as u64);
+        while Instant::now() < deadline {
+            let timeout = deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(10));
+            match rx.recv_timeout(timeout) {
+                Ok(frame) => {
+                    process_audio_frame(frame, segmenter, task_tx, state, overlay, capture)?;
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            }
+        }
     }
     for segment in segmenter.finish()? {
-        submit_segment(segment_tx, state, overlay, segment)?;
+        if capture.streaming_backend && capture.stream_active {
+            finish_active_stream(task_tx, capture, segment)?;
+        } else {
+            submit_segment(task_tx, state, overlay, segment)?;
+        }
+    }
+    if capture.streaming_backend
+        && capture.stream_active
+        && let Some(segment) = fallback_stream_segment(capture)
+    {
+        warn!(samples = segment.samples.len(), "使用当前音频结束未完成的实时流");
+        finish_active_stream(task_tx, capture, segment)?;
     }
     if let Some(input) = capture.audio_input.take() {
         input.stop();
@@ -337,4 +405,52 @@ fn end_capture(
     };
     overlay.set(overlay_state(state, mode));
     Ok(())
+}
+
+fn finish_active_stream(
+    task_tx: &Sender<TranscriptionTask>,
+    capture: &mut CaptureRuntime,
+    segment: SpeechSegment,
+) -> Result<()> {
+    submit_stream_finish(task_tx, segment)?;
+    capture.stream_active = false;
+    capture.stream_start_sample = None;
+    Ok(())
+}
+
+fn fallback_stream_segment(capture: &CaptureRuntime) -> Option<SpeechSegment> {
+    let start = capture.stream_start_sample?.min(capture.session_audio.len());
+    let end = capture.session_audio.len();
+    if start == end {
+        return None;
+    }
+    let samples = capture.session_audio[start..end].to_vec();
+    Some(SpeechSegment {
+        speech_ms: ((samples.len() as u64 * 1_000) / TARGET_SAMPLE_RATE as u64) as u32,
+        samples,
+        reason: SegmentReason::Finish,
+        start_sample: start,
+        end_sample: end,
+        audio_start_sample: start,
+        audio_end_sample: end,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fallback_stream_segment_uses_only_the_active_stream_audio() {
+        let mut capture = CaptureRuntime::new(true);
+        capture.stream_active = true;
+        capture.stream_start_sample = Some(2);
+        capture.session_audio = vec![0, 1, 2, 3, 4, 5];
+
+        let segment = fallback_stream_segment(&capture).unwrap();
+        assert_eq!(segment.samples, vec![2, 3, 4, 5]);
+        assert_eq!(segment.audio_start_sample, 2);
+        assert_eq!(segment.audio_end_sample, 6);
+        assert_eq!(segment.reason, SegmentReason::Finish);
+    }
 }

@@ -1,9 +1,13 @@
 use half::f16;
 use iflytek_core::{
-    CUSTOM_OP_DOMAIN, decoder_cos, decoder_gemm, decoder_layer_norm, decoder_log_softmax,
-    decoder_matmul, decoder_reduce_sum, decoder_sigmoid, decoder_sin, depthwise_conv, gelu_f16,
-    gemm_f16, layer_norm_f16, matmul_f16, original_add, original_multiply, sigmoid_f16,
-    softmax_f16, standard_conv,
+    CUSTOM_OP_DOMAIN, Conv2dParams, decoder_cos, decoder_gemm_column_block, decoder_gemm_element,
+    decoder_gemm_params, decoder_layer_norm, decoder_log_softmax, decoder_matmul,
+    decoder_reduce_sum, decoder_sigmoid, decoder_sin,
+    depthwise_conv_element, depthwise_conv_output_len, gelu_f16, gemm_f16_element,
+    gemm_f16_into, gemm_f16_output_len, gemm_f16_uses_accelerate,
+    gemm_f16_uses_packed_neon, layer_norm_f16, matmul_f16, original_add,
+    original_multiply, pack_decoder_gemm_left_into, sigmoid_f16, softmax_f16, standard_conv_element,
+    standard_conv_into, standard_conv_output_len, standard_conv_uses_accelerate,
 };
 use ort::operator::{Kernel, KernelAttributes, KernelContext, Operator, OperatorDomain, OperatorInput, OperatorOutput};
 use ort::value::TensorElementType;
@@ -16,6 +20,29 @@ fn error(message: impl Into<String>) -> Error {
 fn shape_elements(shape: &ort::value::Shape) -> usize {
     shape.iter().copied().map(|value| value as usize).product()
 }
+
+#[derive(Clone, Copy)]
+struct DisjointOutput<T> {
+    pointer: *mut T,
+    length: usize,
+}
+
+impl<T> DisjointOutput<T> {
+    fn new(values: &mut [T]) -> Self {
+        Self {
+            pointer: values.as_mut_ptr(),
+            length: values.len(),
+        }
+    }
+
+    fn write(self, index: usize, value: T) {
+        assert!(index < self.length);
+        unsafe { self.pointer.add(index).write(value) };
+    }
+}
+
+unsafe impl<T: Send> Send for DisjointOutput<T> {}
+unsafe impl<T: Send> Sync for DisjointOutput<T> {}
 
 struct F16Unary {
     name: &'static str,
@@ -174,11 +201,47 @@ impl Operator for F16Gemm {
             let rows = left_shape[0] as usize;
             let inner = left_shape[1] as usize;
             let columns = right_shape[0] as usize;
-            let computed = gemm_f16(left_values, right_values, bias_values, rows, inner, columns)
-                .map_err(|e| error(e.to_string()))?;
+            let output_len = gemm_f16_output_len(
+                left_values,
+                right_values,
+                bias_values,
+                rows,
+                inner,
+                columns,
+            )
+            .map_err(|e| error(e.to_string()))?;
             let mut output = context.output(0, vec![rows, columns])?.ok_or_else(|| error("missing GEMM output"))?;
             let (_, target) = output.try_extract_tensor_mut::<f16>()?;
-            target.copy_from_slice(&computed);
+            if target.len() != output_len {
+                return Err(error("GEMM output allocation has an invalid size"));
+            }
+            if gemm_f16_uses_accelerate(rows) || gemm_f16_uses_packed_neon(rows) {
+                gemm_f16_into(
+                    left_values,
+                    right_values,
+                    bias_values,
+                    rows,
+                    inner,
+                    columns,
+                    target,
+                )
+                .map_err(|e| error(e.to_string()))?;
+            } else {
+                let target = DisjointOutput::new(target);
+                context.par_for(output_len, 0, move |linear| {
+                    target.write(
+                        linear,
+                        gemm_f16_element(
+                            left_values,
+                            right_values,
+                            bias_values,
+                            inner,
+                            columns,
+                            linear,
+                        ),
+                    );
+                })?;
+            }
             Ok(())
         }))
     }
@@ -206,6 +269,7 @@ impl Operator for DecoderF16Gemm {
     }
 
     fn create_kernel(&self, _: &KernelAttributes) -> Result<Box<dyn Kernel>> {
+        let packed_left_workspace = std::sync::Mutex::new(Vec::<f16>::new());
         Ok(Box::new(move |context: &KernelContext| {
             let left = context.input(0)?.ok_or_else(|| error("missing decoder GEMM left input"))?;
             let right = context.input(1)?.ok_or_else(|| error("missing decoder GEMM right input"))?;
@@ -219,11 +283,59 @@ impl Operator for DecoderF16Gemm {
             let rows = left_shape[0] as usize;
             let inner = left_shape[1] as usize;
             let columns = right_shape[0] as usize;
-            let computed = decoder_gemm(left_values, right_values, bias_values, rows, inner, columns)
-                .map_err(|e| error(e.to_string()))?;
+            let params = decoder_gemm_params(
+                left_values,
+                right_values,
+                bias_values,
+                rows,
+                inner,
+                columns,
+            )
+            .map_err(|e| error(e.to_string()))?;
             let mut output = context.output(0, vec![rows, columns])?.ok_or_else(|| error("missing decoder GEMM output"))?;
             let (_, target) = output.try_extract_tensor_mut::<f16>()?;
-            target.copy_from_slice(&computed);
+            if target.len() != params.output_len() {
+                return Err(error("decoder GEMM output allocation has an invalid size"));
+            }
+            let target = DisjointOutput::new(target);
+            if params.uses_packed_neon() {
+                let mut packed_left = packed_left_workspace
+                    .lock()
+                    .map_err(|_| error("decoder GEMM workspace lock poisoned"))?;
+                pack_decoder_gemm_left_into(left_values, params, &mut packed_left);
+                let packed_left = packed_left.as_slice();
+                context.par_for(params.column_blocks(), 0, move |block| {
+                    let values = decoder_gemm_column_block(
+                        packed_left,
+                        right_values,
+                        bias_values,
+                        params,
+                        block,
+                    );
+                    let first_column = block * 4;
+                    for column in 0..values.columns() {
+                        for row in 0..params.rows() {
+                            target.write(
+                                row * params.columns() + first_column + column,
+                                values.value(column, row),
+                            );
+                        }
+                    }
+                })?;
+            } else {
+                context.par_for(params.output_len(), 0, move |linear| {
+                    target.write(
+                        linear,
+                        decoder_gemm_element(
+                            left_values,
+                            right_values,
+                            bias_values,
+                            params,
+                            linear,
+                        ),
+                    );
+                })?;
+            }
             Ok(())
         }))
     }
@@ -523,18 +635,57 @@ impl Operator for F16Conv {
             let output_channels = weight_shape[0] as usize;
             let kernel_height = weight_shape[2] as usize;
             let kernel_width = weight_shape[3] as usize;
-            let computed = if depthwise {
-                depthwise_conv(input_values, weight_values, bias_values, batch, input_channels, input_height, input_width, kernel_height, kernel_width)
+            let params = Conv2dParams {
+                batch,
+                input_channels,
+                input_height,
+                input_width,
+                output_channels: if depthwise { input_channels } else { output_channels },
+                kernel_height,
+                kernel_width,
+                stride_height: if depthwise { 1 } else { stride_height },
+                stride_width: if depthwise { 1 } else { stride_width },
+            };
+            let output_len = if depthwise {
+                depthwise_conv_output_len(input_values, weight_values, bias_values, params)
             } else {
-                standard_conv(input_values, weight_values, bias_values, batch, input_channels, input_height, input_width, output_channels, kernel_height, kernel_width, stride_height, stride_width)
+                standard_conv_output_len(input_values, weight_values, bias_values, params)
             }
             .map_err(|e| error(e.to_string()))?;
-            let output_height = (input_height - kernel_height) / stride_height + 1;
-            let output_width = (input_width - kernel_width) / stride_width + 1;
-            let output_channels = if depthwise { input_channels } else { output_channels };
+            let output_height = params.output_height();
+            let output_width = params.output_width();
+            let output_channels = params.output_channels;
             let mut output = context.output(0, vec![batch, output_channels, output_height, output_width])?.ok_or_else(|| error("missing convolution output"))?;
             let (_, target) = output.try_extract_tensor_mut::<f16>()?;
-            target.copy_from_slice(&computed);
+            if target.len() != output_len {
+                return Err(error("convolution output allocation has an invalid size"));
+            }
+            if !depthwise && standard_conv_uses_accelerate(params) {
+                standard_conv_into(input_values, weight_values, bias_values, params, target)
+                    .map_err(|e| error(e.to_string()))?;
+            } else {
+                let target = DisjointOutput::new(target);
+                context.par_for(output_len, 0, move |linear| {
+                    let value = if depthwise {
+                        depthwise_conv_element(
+                            input_values,
+                            weight_values,
+                            bias_values,
+                            params,
+                            linear,
+                        )
+                    } else {
+                        standard_conv_element(
+                            input_values,
+                            weight_values,
+                            bias_values,
+                            params,
+                            linear,
+                        )
+                    };
+                    target.write(linear, value);
+                })?;
+            }
             Ok(())
         }))
     }

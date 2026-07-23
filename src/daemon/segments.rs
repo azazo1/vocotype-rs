@@ -1,7 +1,5 @@
-use std::time::{Duration, Instant};
-
 use anyhow::{Result, anyhow};
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::Sender;
 use tracing::info;
 
 use crate::models::ModelStore;
@@ -10,6 +8,7 @@ use crate::vad::{SpeechSegment, VadConfig, VadSegmenter};
 
 use super::DaemonOptions;
 use super::state::{SharedRuntimeState, increment_queue, overlay_state};
+use super::worker::TranscriptionTask;
 
 pub(super) fn build_segmenter(
     options: &DaemonOptions,
@@ -34,7 +33,7 @@ pub(super) fn build_segmenter(
 }
 
 pub(super) fn submit_segment(
-    segment_tx: &Sender<SpeechSegment>,
+    task_tx: &Sender<TranscriptionTask>,
     state: &SharedRuntimeState,
     overlay: &OverlayHandle,
     segment: SpeechSegment,
@@ -51,36 +50,45 @@ pub(super) fn submit_segment(
 
     let pending = increment_queue(state)?;
     overlay.set(overlay_state(state, OverlayMode::Transcribing { pending }));
-    segment_tx
-        .send(segment)
+    task_tx
+        .send(TranscriptionTask::Segment(segment))
         .map_err(|error| anyhow!("无法提交转写任务: {}", error))?;
     Ok(())
 }
 
-pub(super) fn drain_release_tail(
-    audio_rx: &Receiver<Vec<i16>>,
-    segmenter: &mut VadSegmenter,
-    segment_tx: &Sender<SpeechSegment>,
+pub(super) fn submit_stream_start(
+    task_tx: &Sender<TranscriptionTask>,
     state: &SharedRuntimeState,
     overlay: &OverlayHandle,
-    wait: Duration,
-) -> Result<()> {
-    let deadline = Instant::now() + wait;
-    while Instant::now() < deadline {
-        let timeout = deadline
-            .saturating_duration_since(Instant::now())
-            .min(Duration::from_millis(10));
-        match audio_rx.recv_timeout(timeout) {
-            Ok(frame) => {
-                for segment in segmenter.push(&frame)? {
-                    submit_segment(segment_tx, state, overlay, segment)?;
-                }
-            }
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-        }
+    samples: Vec<i16>,
+) -> Result<bool> {
+    if samples.is_empty() {
+        return Ok(false);
     }
-    Ok(())
+    let pending = increment_queue(state)?;
+    overlay.set(overlay_state(state, OverlayMode::Transcribing { pending }));
+    task_tx
+        .send(TranscriptionTask::StreamStart(samples))
+        .map_err(|error| anyhow!("无法开始实时流式转写: {}", error))?;
+    Ok(true)
+}
+
+pub(super) fn submit_stream_audio(
+    task_tx: &Sender<TranscriptionTask>,
+    samples: Vec<i16>,
+) -> Result<()> {
+    task_tx
+        .send(TranscriptionTask::StreamAudio(samples))
+        .map_err(|error| anyhow!("无法提交实时流式音频: {}", error))
+}
+
+pub(super) fn submit_stream_finish(
+    task_tx: &Sender<TranscriptionTask>,
+    segment: SpeechSegment,
+) -> Result<()> {
+    task_tx
+        .send(TranscriptionTask::StreamFinish(segment))
+        .map_err(|error| anyhow!("无法结束实时流式转写: {}", error))
 }
 
 pub(super) fn frame_level(frame: &[i16]) -> f32 {

@@ -4,6 +4,16 @@ use half::f16;
 
 use crate::numerics;
 
+mod accelerate;
+mod decoder_gemm;
+mod neon;
+
+pub use decoder_gemm::{
+    DecoderGemmBlock, DecoderGemmParams, decoder_gemm_column_block, decoder_gemm_element,
+    decoder_gemm_into, decoder_gemm_params, pack_decoder_gemm_left,
+    pack_decoder_gemm_left_into,
+};
+
 static DECODER_ACTIVE_ROWS: AtomicI32 = AtomicI32::new(1);
 
 pub fn decoder_active_rows() -> i32 {
@@ -26,63 +36,99 @@ fn rounded_mul(left: f16, right: f16) -> f16 {
     f16::from_f32(left.to_f32() * right.to_f32())
 }
 
-pub fn gemm_f16(left: &[f16], right: &[f16], bias: &[f16], rows: usize, inner: usize, columns: usize) -> anyhow::Result<Vec<f16>> {
-    if left.len() != rows * inner || right.len() != columns * inner || bias.len() != columns {
-        anyhow::bail!("invalid GEMM dimensions")
+pub const fn optimized_kernel_backend() -> &'static str {
+    if accelerate::available() {
+        "accelerate-neon"
+    } else if neon::available() {
+        "neon"
+    } else {
+        "portable"
     }
-    let mut output = vec![f16::from_f32(0.0); rows * columns];
-    for row in 0..rows {
-        for column in 0..columns {
-            let mut value = bias[column].to_f32();
-            for index in 0..inner {
-                value = left[row * inner + index]
-                    .to_f32()
-                    .mul_add(right[column * inner + index].to_f32(), value);
-            }
-            output[row * columns + column] = f16::from_f32(value);
-        }
-    }
-    Ok(output)
 }
 
-pub fn decoder_gemm(left: &[f16], right: &[f16], bias: &[f16], rows: usize, inner: usize, columns: usize) -> anyhow::Result<Vec<f16>> {
-    if left.len() != rows * inner || right.len() != columns * inner || bias.len() != columns {
-        anyhow::bail!("invalid decoder GEMM dimensions")
+pub fn gemm_f16_output_len(
+    left: &[f16],
+    right: &[f16],
+    bias: &[f16],
+    rows: usize,
+    inner: usize,
+    columns: usize,
+) -> anyhow::Result<usize> {
+    let left_len = rows
+        .checked_mul(inner)
+        .ok_or_else(|| anyhow::anyhow!("GEMM left dimensions overflow"))?;
+    let right_len = columns
+        .checked_mul(inner)
+        .ok_or_else(|| anyhow::anyhow!("GEMM right dimensions overflow"))?;
+    let output_len = rows
+        .checked_mul(columns)
+        .ok_or_else(|| anyhow::anyhow!("GEMM output dimensions overflow"))?;
+    if rows == 0
+        || inner == 0
+        || columns == 0
+        || left.len() != left_len
+        || right.len() != right_len
+        || bias.len() != columns
+    {
+        anyhow::bail!("invalid GEMM dimensions")
     }
-    let active = decoder_active_rows() as usize;
-    if active > rows {
-        anyhow::bail!("decoder active rows exceed row count")
+    Ok(output_len)
+}
+
+pub const fn gemm_f16_uses_accelerate(rows: usize) -> bool {
+    accelerate::available() && rows >= 8
+}
+
+pub const fn gemm_f16_uses_packed_neon(rows: usize) -> bool {
+    !accelerate::available() && neon::available() && rows >= 8 && rows.is_multiple_of(8)
+}
+
+pub fn gemm_f16_element(
+    left: &[f16],
+    right: &[f16],
+    bias: &[f16],
+    inner: usize,
+    columns: usize,
+    linear: usize,
+) -> f16 {
+    let row = linear / columns;
+    let column = linear % columns;
+    let mut value = bias[column].to_f32();
+    for index in 0..inner {
+        value = left[row * inner + index]
+            .to_f32()
+            .mul_add(right[column * inner + index].to_f32(), value);
     }
-    let paired = active == 1;
-    if paired && !inner.is_multiple_of(4) {
-        anyhow::bail!("one-row decoder GEMM requires an inner multiple of four")
+    f16::from_f32(value)
+}
+
+pub fn gemm_f16_into(
+    left: &[f16],
+    right: &[f16],
+    bias: &[f16],
+    rows: usize,
+    inner: usize,
+    columns: usize,
+    output: &mut [f16],
+) -> anyhow::Result<()> {
+    let output_len = gemm_f16_output_len(left, right, bias, rows, inner, columns)?;
+    if output.len() != output_len {
+        anyhow::bail!("invalid GEMM output dimensions")
     }
-    let mut output = vec![f16::from_f32(0.0); rows * columns];
-    for row in 0..rows {
-        for column in 0..columns {
-            let mut even = bias[column];
-            let mut odd = f16::from_f32(0.0);
-            for index in 0..inner {
-                let accumulator = if paired && index & 1 != 0 {
-                    &mut odd
-                } else {
-                    &mut even
-                };
-                *accumulator = f16::from_f32(
-                    left[row * inner + index].to_f32().mul_add(
-                        right[column * inner + index].to_f32(),
-                        accumulator.to_f32(),
-                    ),
-                );
-            }
-            output[row * columns + column] = if paired {
-                rounded_add(even, odd)
-            } else {
-                even
-            };
-        }
+    if gemm_f16_uses_accelerate(rows) {
+        return accelerate::gemm_f16_into(
+            left, right, bias, rows, inner, columns, output,
+        );
     }
-    Ok(output)
+    if gemm_f16_uses_packed_neon(rows)
+        && neon::packed_gemm_f16_into(left, right, bias, rows, inner, columns, output)
+    {
+        return Ok(());
+    }
+    for (linear, target) in output.iter_mut().enumerate() {
+        *target = gemm_f16_element(left, right, bias, inner, columns, linear);
+    }
+    Ok(())
 }
 
 pub fn matmul_f16(left: &[f16], right: &[f16], rows: usize, inner: usize, columns: usize) -> anyhow::Result<Vec<f16>> {
@@ -393,145 +439,239 @@ pub fn gelu_f16(input: &[f16]) -> Vec<f16> {
     input.iter().copied().map(numerics::gelu).collect()
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn standard_conv(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Conv2dParams {
+    pub batch: usize,
+    pub input_channels: usize,
+    pub input_height: usize,
+    pub input_width: usize,
+    pub output_channels: usize,
+    pub kernel_height: usize,
+    pub kernel_width: usize,
+    pub stride_height: usize,
+    pub stride_width: usize,
+}
+
+impl Conv2dParams {
+    pub const fn output_height(self) -> usize {
+        (self.input_height - self.kernel_height) / self.stride_height + 1
+    }
+
+    pub const fn output_width(self) -> usize {
+        (self.input_width - self.kernel_width) / self.stride_width + 1
+    }
+}
+
+pub fn standard_conv_output_len(
     input: &[f16],
     weights: &[f16],
     bias: &[f16],
-    batch: usize,
-    input_channels: usize,
-    input_height: usize,
-    input_width: usize,
-    output_channels: usize,
-    kernel_height: usize,
-    kernel_width: usize,
-    stride_height: usize,
-    stride_width: usize,
-) -> anyhow::Result<Vec<f16>> {
-    if input.len() != batch * input_channels * input_height * input_width
-        || weights.len() != output_channels * input_channels * kernel_height * kernel_width
-        || bias.len() != output_channels
-        || (input_channels != 1 && !input_channels.is_multiple_of(8))
-        || kernel_height == 0
-        || kernel_width == 0
-        || kernel_height > input_height
-        || kernel_width > input_width
-        || stride_height == 0
-        || stride_width == 0
+    params: Conv2dParams,
+) -> anyhow::Result<usize> {
+    let input_len = params
+        .batch
+        .checked_mul(params.input_channels)
+        .and_then(|value| value.checked_mul(params.input_height))
+        .and_then(|value| value.checked_mul(params.input_width))
+        .ok_or_else(|| anyhow::anyhow!("convolution input dimensions overflow"))?;
+    let weight_len = params
+        .output_channels
+        .checked_mul(params.input_channels)
+        .and_then(|value| value.checked_mul(params.kernel_height))
+        .and_then(|value| value.checked_mul(params.kernel_width))
+        .ok_or_else(|| anyhow::anyhow!("convolution weight dimensions overflow"))?;
+    if params.batch == 0
+        || params.input_channels == 0
+        || params.input_height == 0
+        || params.input_width == 0
+        || params.output_channels == 0
+        || params.kernel_height == 0
+        || params.kernel_width == 0
+        || params.kernel_height > params.input_height
+        || params.kernel_width > params.input_width
+        || params.stride_height == 0
+        || params.stride_width == 0
+        || (params.input_channels != 1 && !params.input_channels.is_multiple_of(8))
+        || input.len() != input_len
+        || weights.len() != weight_len
+        || bias.len() != params.output_channels
     {
         anyhow::bail!("invalid convolution dimensions")
     }
-    let output_height = (input_height - kernel_height) / stride_height + 1;
-    let output_width = (input_width - kernel_width) / stride_width + 1;
-    let mut output = vec![f16::from_f32(0.0); batch * output_channels * output_height * output_width];
-    for batch_index in 0..batch {
-        for (channel, bias_value) in bias.iter().copied().enumerate() {
-            for y in 0..output_height {
-                for x in 0..output_width {
-                    let mut stash = 0.0_f32;
-                    let channel_group = if input_channels == 1 { 1 } else { 8 };
-                    for channel_block in (0..input_channels).step_by(channel_group) {
-                        let mut group = [f16::from_f32(0.0); 8];
-                        for kernel_y in 0..kernel_height {
-                            for kernel_x in 0..kernel_width {
-                                for (lane, accumulator) in
-                                    group.iter_mut().enumerate().take(channel_group)
-                                {
-                                    let input_channel = channel_block + lane;
-                                    let input_index = (((batch_index * input_channels
-                                        + input_channel)
-                                        * input_height
-                                        + y * stride_height
-                                        + kernel_y)
-                                        * input_width)
-                                        + x * stride_width
-                                        + kernel_x;
-                                    let weight_index = (((channel * input_channels
-                                        + input_channel)
-                                        * kernel_height
-                                        + kernel_y)
-                                        * kernel_width)
-                                        + kernel_x;
-                                    *accumulator = rounded_add(
-                                        rounded_mul(input[input_index], weights[weight_index]),
-                                        *accumulator,
-                                    );
-                                }
-                            }
-                        }
-                        for lane in (0..channel_group).rev() {
-                            stash += group[lane].to_f32();
-                        }
-                    }
-                    let output_index = (((batch_index * output_channels + channel) * output_height + y) * output_width) + x;
-                    output[output_index] = rounded_add(f16::from_f32(stash), bias_value);
-                }
-            }
-        }
-    }
-    Ok(output)
+    params
+        .batch
+        .checked_mul(params.output_channels)
+        .and_then(|value| value.checked_mul(params.output_height()))
+        .and_then(|value| value.checked_mul(params.output_width()))
+        .ok_or_else(|| anyhow::anyhow!("convolution output dimensions overflow"))
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn depthwise_conv(
+pub const fn standard_conv_uses_accelerate(params: Conv2dParams) -> bool {
+    accelerate::available() && params.input_channels != 1
+}
+
+pub fn standard_conv_element(
     input: &[f16],
     weights: &[f16],
     bias: &[f16],
-    batch: usize,
-    channels: usize,
-    input_height: usize,
-    input_width: usize,
-    kernel_height: usize,
-    kernel_width: usize,
-) -> anyhow::Result<Vec<f16>> {
-    if input.len() != batch * channels * input_height * input_width
-        || weights.len() != channels * kernel_height * kernel_width
-        || bias.len() != channels
-        || kernel_height > input_height
-        || kernel_width > input_width
-    {
-        anyhow::bail!("invalid depthwise convolution dimensions")
-    }
-    let output_height = input_height - kernel_height + 1;
-    let output_width = input_width - kernel_width + 1;
-    let mut output = vec![
-        f16::from_f32(0.0);
-        batch * channels * output_height * output_width
-    ];
-    for batch_index in 0..batch {
-        for (channel, bias_value) in bias.iter().copied().enumerate() {
-            for output_y in 0..output_height {
-                for output_x in 0..output_width {
-                    let mut accumulator = bias_value;
-                    for kernel_y in 0..kernel_height {
-                        for kernel_x in 0..kernel_width {
-                            let input_index = (((batch_index * channels + channel)
-                                * input_height
-                                + output_y
-                                + kernel_y)
-                                * input_width)
-                                + output_x
-                                + kernel_x;
-                            let weight_index = (channel * kernel_height + kernel_y)
-                                * kernel_width
-                                + kernel_x;
-                            accumulator = rounded_add(
-                                rounded_mul(input[input_index], weights[weight_index]),
-                                accumulator,
-                            );
-                        }
-                    }
-                    let output_index = (((batch_index * channels + channel)
-                        * output_height
-                        + output_y)
-                        * output_width)
-                        + output_x;
-                    output[output_index] = accumulator;
+    params: Conv2dParams,
+    linear: usize,
+) -> f16 {
+    let output_height = params.output_height();
+    let output_width = params.output_width();
+    let output_x = linear % output_width;
+    let output_y = (linear / output_width) % output_height;
+    let output_channel =
+        (linear / (output_width * output_height)) % params.output_channels;
+    let batch = linear / (output_width * output_height * params.output_channels);
+    let mut stash = 0.0_f32;
+    let channel_group = if params.input_channels == 1 { 1 } else { 8 };
+    for channel_block in (0..params.input_channels).step_by(channel_group) {
+        let mut group = [f16::ZERO; 8];
+        for kernel_y in 0..params.kernel_height {
+            for kernel_x in 0..params.kernel_width {
+                for (lane, accumulator) in group.iter_mut().enumerate().take(channel_group) {
+                    let input_channel = channel_block + lane;
+                    let input_y = output_y * params.stride_height + kernel_y;
+                    let input_x = output_x * params.stride_width + kernel_x;
+                    let input_index = ((batch * params.input_channels + input_channel)
+                        * params.input_height
+                        + input_y)
+                        * params.input_width
+                        + input_x;
+                    let weight_index = ((output_channel * params.input_channels + input_channel)
+                        * params.kernel_height
+                        + kernel_y)
+                        * params.kernel_width
+                        + kernel_x;
+                    *accumulator = rounded_add(
+                        rounded_mul(input[input_index], weights[weight_index]),
+                        *accumulator,
+                    );
                 }
             }
         }
+        for lane in (0..channel_group).rev() {
+            stash += group[lane].to_f32();
+        }
     }
-    Ok(output)
+    rounded_add(f16::from_f32(stash), bias[output_channel])
+}
+
+pub fn standard_conv_into(
+    input: &[f16],
+    weights: &[f16],
+    bias: &[f16],
+    params: Conv2dParams,
+    output: &mut [f16],
+) -> anyhow::Result<()> {
+    let output_len = standard_conv_output_len(input, weights, bias, params)?;
+    if output.len() != output_len {
+        anyhow::bail!("invalid convolution output dimensions")
+    }
+    if standard_conv_uses_accelerate(params) {
+        return accelerate::standard_conv_f16_into(input, weights, bias, params, output);
+    }
+    for (linear, target) in output.iter_mut().enumerate() {
+        *target = standard_conv_element(input, weights, bias, params, linear);
+    }
+    Ok(())
+}
+
+pub fn depthwise_conv_output_len(
+    input: &[f16],
+    weights: &[f16],
+    bias: &[f16],
+    params: Conv2dParams,
+) -> anyhow::Result<usize> {
+    if params.output_channels != params.input_channels
+        || params.stride_height != 1
+        || params.stride_width != 1
+    {
+        anyhow::bail!("invalid depthwise convolution parameters")
+    }
+    let input_len = params
+        .batch
+        .checked_mul(params.input_channels)
+        .and_then(|value| value.checked_mul(params.input_height))
+        .and_then(|value| value.checked_mul(params.input_width))
+        .ok_or_else(|| anyhow::anyhow!("depthwise convolution input dimensions overflow"))?;
+    let weight_len = params
+        .input_channels
+        .checked_mul(params.kernel_height)
+        .and_then(|value| value.checked_mul(params.kernel_width))
+        .ok_or_else(|| anyhow::anyhow!("depthwise convolution weight dimensions overflow"))?;
+    if params.batch == 0
+        || params.input_channels == 0
+        || params.input_height == 0
+        || params.input_width == 0
+        || params.kernel_height == 0
+        || params.kernel_width == 0
+        || params.kernel_height > params.input_height
+        || params.kernel_width > params.input_width
+        || input.len() != input_len
+        || weights.len() != weight_len
+        || bias.len() != params.input_channels
+    {
+        anyhow::bail!("invalid depthwise convolution dimensions")
+    }
+    params
+        .batch
+        .checked_mul(params.input_channels)
+        .and_then(|value| value.checked_mul(params.output_height()))
+        .and_then(|value| value.checked_mul(params.output_width()))
+        .ok_or_else(|| anyhow::anyhow!("depthwise convolution output dimensions overflow"))
+}
+
+pub fn depthwise_conv_element(
+    input: &[f16],
+    weights: &[f16],
+    bias: &[f16],
+    params: Conv2dParams,
+    linear: usize,
+) -> f16 {
+    let output_height = params.output_height();
+    let output_width = params.output_width();
+    let output_x = linear % output_width;
+    let output_y = (linear / output_width) % output_height;
+    let channel = (linear / (output_width * output_height)) % params.input_channels;
+    let batch = linear / (output_width * output_height * params.input_channels);
+    let mut accumulator = bias[channel];
+    for kernel_y in 0..params.kernel_height {
+        for kernel_x in 0..params.kernel_width {
+            let input_index = ((batch * params.input_channels + channel) * params.input_height
+                + output_y
+                + kernel_y)
+                * params.input_width
+                + output_x
+                + kernel_x;
+            let weight_index = (channel * params.kernel_height + kernel_y)
+                * params.kernel_width
+                + kernel_x;
+            accumulator = rounded_add(
+                rounded_mul(input[input_index], weights[weight_index]),
+                accumulator,
+            );
+        }
+    }
+    accumulator
+}
+
+pub fn depthwise_conv_into(
+    input: &[f16],
+    weights: &[f16],
+    bias: &[f16],
+    params: Conv2dParams,
+    output: &mut [f16],
+) -> anyhow::Result<()> {
+    let output_len = depthwise_conv_output_len(input, weights, bias, params)?;
+    if output.len() != output_len {
+        anyhow::bail!("invalid depthwise convolution output dimensions")
+    }
+    for (linear, target) in output.iter_mut().enumerate() {
+        *target = depthwise_conv_element(input, weights, bias, params, linear);
+    }
+    Ok(())
 }
 
 pub fn punctuation_qk(query: &[f32], key: &[f32], batches: usize, rows: usize, inner: usize) -> anyhow::Result<Vec<f32>> {
@@ -615,12 +755,39 @@ pub fn punctuation_softmax(input: &[f32], rows: usize, columns: usize) -> anyhow
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use half::f16;
 
     use super::{
-        decoder_active_rows, decoder_matmul, matmul_f16, original_add,
-        set_decoder_active_rows, standard_conv,
+        Conv2dParams, decoder_active_rows, decoder_gemm_element, decoder_gemm_into,
+        decoder_gemm_params, decoder_matmul, gemm_f16_element, gemm_f16_into, matmul_f16,
+        original_add, set_decoder_active_rows, standard_conv_element, standard_conv_into,
     };
+
+    static DECODER_ACTIVE_ROWS_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn patterned_f16(length: usize, offset: usize) -> Vec<f16> {
+        (0..length)
+            .map(|index| {
+                let value = ((index * 17 + offset) % 29) as f32 - 14.0;
+                f16::from_f32(value / 32.0)
+            })
+            .collect()
+    }
+
+    fn assert_f16_close(actual: &[f16], expected: &[f16], tolerance: f32) {
+        assert_eq!(actual.len(), expected.len());
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            let actual = actual.to_f32();
+            let expected = expected.to_f32();
+            assert!(actual.is_finite(), "output {index} is not finite");
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "output {index} differs: actual={actual}, expected={expected}"
+            );
+        }
+    }
 
     #[test]
     fn original_add_supports_multidimensional_broadcast_with_half_rounding() {
@@ -676,19 +843,172 @@ mod tests {
     }
 
     #[test]
+    fn decoder_gemm_neon_matches_scalar_for_active_rows() {
+        let _guard = DECODER_ACTIVE_ROWS_TEST_LOCK.lock().unwrap();
+        let rows = 8;
+        let inner = 12;
+        let columns = 9;
+        let left = patterned_f16(rows * inner, 3);
+        let right = patterned_f16(columns * inner, 7);
+        let bias = patterned_f16(columns, 11);
+        for active_rows in [1, 8] {
+            set_decoder_active_rows(active_rows).unwrap();
+            let params = decoder_gemm_params(
+                &left,
+                &right,
+                &bias,
+                rows,
+                inner,
+                columns,
+            )
+            .unwrap();
+            let expected = (0..params.output_len())
+                .map(|linear| decoder_gemm_element(&left, &right, &bias, params, linear))
+                .collect::<Vec<_>>();
+            let mut actual = vec![f16::ZERO; params.output_len()];
+            decoder_gemm_into(
+                &left,
+                &right,
+                &bias,
+                rows,
+                inner,
+                columns,
+                &mut actual,
+            )
+            .unwrap();
+            assert_eq!(actual, expected);
+        }
+        set_decoder_active_rows(1).unwrap();
+    }
+
+    #[test]
     fn convolution_accumulates_channel_groups_before_bias() {
         let input = [f16::ONE; 8];
         let weights = [f16::from_f32(0.5); 8];
         let bias = [f16::from_f32(0.25)];
-        let output = standard_conv(
-            &input, &weights, &bias, 1, 8, 1, 1, 1, 1, 1, 1, 1,
+        let mut output = [f16::ZERO; 1];
+        standard_conv_into(
+            &input,
+            &weights,
+            &bias,
+            Conv2dParams {
+                batch: 1,
+                input_channels: 8,
+                input_height: 1,
+                input_width: 1,
+                output_channels: 1,
+                kernel_height: 1,
+                kernel_width: 1,
+                stride_height: 1,
+                stride_width: 1,
+            },
+            &mut output,
         )
         .unwrap();
         assert_eq!(output, [f16::from_f32(4.25)]);
     }
 
     #[test]
+    fn optimized_gemm_matches_reference_for_non_multiple_row_count() {
+        let rows = 9;
+        let inner = 13;
+        let columns = 7;
+        let left = patterned_f16(rows * inner, 3);
+        let right = patterned_f16(columns * inner, 7);
+        let bias = patterned_f16(columns, 11);
+        let expected = (0..rows * columns)
+            .map(|linear| {
+                gemm_f16_element(&left, &right, &bias, inner, columns, linear)
+            })
+            .collect::<Vec<_>>();
+        let mut actual = vec![f16::ZERO; expected.len()];
+
+        gemm_f16_into(
+            &left,
+            &right,
+            &bias,
+            rows,
+            inner,
+            columns,
+            &mut actual,
+        )
+        .unwrap();
+
+        assert_f16_close(&actual, &expected, 0.004);
+    }
+
+    #[test]
+    fn im2col_convolution_matches_reference() {
+        let params = Conv2dParams {
+            batch: 2,
+            input_channels: 8,
+            input_height: 4,
+            input_width: 5,
+            output_channels: 3,
+            kernel_height: 2,
+            kernel_width: 3,
+            stride_height: 2,
+            stride_width: 1,
+        };
+        let input = patterned_f16(
+            params.batch * params.input_channels * params.input_height * params.input_width,
+            5,
+        );
+        let weights = patterned_f16(
+            params.output_channels
+                * params.input_channels
+                * params.kernel_height
+                * params.kernel_width,
+            13,
+        );
+        let bias = patterned_f16(params.output_channels, 19);
+        let output_len = params.batch
+            * params.output_channels
+            * params.output_height()
+            * params.output_width();
+        let expected = (0..output_len)
+            .map(|linear| standard_conv_element(&input, &weights, &bias, params, linear))
+            .collect::<Vec<_>>();
+        let mut actual = vec![f16::ZERO; output_len];
+
+        standard_conv_into(&input, &weights, &bias, params, &mut actual).unwrap();
+
+        assert_f16_close(&actual, &expected, 0.05);
+    }
+
+    #[test]
+    fn single_channel_convolution_keeps_reference_order() {
+        let params = Conv2dParams {
+            batch: 1,
+            input_channels: 1,
+            input_height: 4,
+            input_width: 5,
+            output_channels: 2,
+            kernel_height: 3,
+            kernel_width: 2,
+            stride_height: 1,
+            stride_width: 2,
+        };
+        let input = patterned_f16(params.input_height * params.input_width, 2);
+        let weights = patterned_f16(
+            params.output_channels * params.kernel_height * params.kernel_width,
+            17,
+        );
+        let bias = patterned_f16(params.output_channels, 23);
+        let output_len = params.output_channels * params.output_height() * params.output_width();
+        let expected = (0..output_len)
+            .map(|linear| standard_conv_element(&input, &weights, &bias, params, linear))
+            .collect::<Vec<_>>();
+        let mut actual = vec![f16::ZERO; output_len];
+
+        standard_conv_into(&input, &weights, &bias, params, &mut actual).unwrap();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn decoder_active_rows_rejects_invalid_values() {
+        let _guard = DECODER_ACTIVE_ROWS_TEST_LOCK.lock().unwrap();
         set_decoder_active_rows(3).unwrap();
         assert_eq!(decoder_active_rows(), 3);
         assert!(set_decoder_active_rows(0).is_err());

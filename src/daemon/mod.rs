@@ -1,6 +1,7 @@
 mod runtime;
 mod segments;
 mod state;
+mod streaming;
 mod worker;
 
 use std::path::PathBuf;

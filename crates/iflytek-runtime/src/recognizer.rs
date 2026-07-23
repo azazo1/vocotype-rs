@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 use anyhow::{Result, bail};
 
 use crate::decoder::EdgeEsrDecoder;
@@ -6,6 +8,14 @@ use crate::encoder::{ENCODER_CHUNK_FRAMES, EdgeEsrEncoder, EncoderChunk};
 const HIDDEN_SIZE: usize = 512;
 const SEQUENCE_LIMIT: usize = 2_048;
 const MAX_DECODER_CALLS: usize = 2_048;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct RecognizerTimings {
+    pub(crate) encoder: Duration,
+    pub(crate) decoder: Duration,
+    pub(crate) attention: Duration,
+    pub(crate) beam: Duration,
+}
 
 #[derive(Default)]
 pub(crate) struct EncoderBank {
@@ -47,6 +57,7 @@ pub(crate) struct EdgeEsrRecognizer<'a> {
     bank: EncoderBank,
     decoder_calls: usize,
     finalized: bool,
+    encoder_elapsed: Duration,
 }
 
 impl<'a> EdgeEsrRecognizer<'a> {
@@ -57,11 +68,14 @@ impl<'a> EdgeEsrRecognizer<'a> {
             bank: EncoderBank::default(),
             decoder_calls: 0,
             finalized: false,
+            encoder_elapsed: Duration::ZERO,
         }
     }
 
     pub(crate) fn prime_encoder(&mut self) -> Result<usize> {
+        let started = Instant::now();
         let discarded = self.encoder.prime_startup()?;
+        self.encoder_elapsed += started.elapsed();
         Ok(discarded.len())
     }
 
@@ -69,7 +83,9 @@ impl<'a> EdgeEsrRecognizer<'a> {
         if self.finalized {
             bail!("EdgeEsr recognizer is already finalized")
         }
+        let encoder_started = Instant::now();
         let chunks = self.encoder.accept_pcm(samples, final_input)?;
+        self.encoder_elapsed += encoder_started.elapsed();
         let final_group = if final_input { chunks.len().min(2) } else { 0 };
         let normal_end = chunks.len() - final_group;
         for chunk in chunks[..normal_end].iter().cloned() {
@@ -91,6 +107,16 @@ impl<'a> EdgeEsrRecognizer<'a> {
             .search()
             .best_candidate(self.finalized)
             .map(|candidate| (candidate.path.as_slice(), candidate.normalized_score))
+    }
+
+    pub(crate) fn timings(&self) -> RecognizerTimings {
+        let decoder = self.decoder.timings();
+        RecognizerTimings {
+            encoder: self.encoder_elapsed,
+            decoder: decoder.onnx,
+            attention: decoder.attention,
+            beam: decoder.beam,
+        }
     }
 
     fn pump_decoder(&mut self, final_flush: bool) -> Result<()> {

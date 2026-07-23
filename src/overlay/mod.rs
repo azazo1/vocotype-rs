@@ -5,6 +5,8 @@ mod fonts;
 mod platform;
 mod state;
 
+pub(super) const OVERLAY_WIDTH: f32 = 560.0;
+
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow};
@@ -13,7 +15,7 @@ use tracing::{info, warn};
 
 use app::OverlayApp;
 
-pub use state::{OverlayMode, OverlayState};
+pub use state::{OverlayMode, OverlayState, StreamingTranscript};
 
 #[derive(Clone)]
 pub struct OverlayHandle {
@@ -77,7 +79,7 @@ fn overlay_viewport() -> egui::ViewportBuilder {
         .with_title("VocoType")
         .with_decorations(false)
         .with_resizable(false)
-        .with_inner_size([360.0, 108.0])
+        .with_inner_size([OVERLAY_WIDTH, 108.0])
         .with_always_on_top()
         .with_visible(false)
         .with_active(false)

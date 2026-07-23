@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use iflytek_core::{
@@ -7,6 +8,7 @@ use iflytek_core::{
 };
 use ort::session::Session;
 use ort::value::Tensor;
+use tracing::{info, trace};
 
 const STACKED_FRAMES: usize = 4;
 const VAD_INPUT_SIZE: usize = VAD_FEATURE_SIZE * STACKED_FRAMES;
@@ -89,6 +91,10 @@ pub struct EdgeEsrVad {
     endpoint: OriginalVadEndpoint,
     active_segment_start: Option<i32>,
     active_speech_start: Option<i32>,
+    stream_started: Option<Instant>,
+    frontend_elapsed: Duration,
+    onnx_elapsed: Duration,
+    inference_groups: usize,
 }
 
 impl EdgeEsrVad {
@@ -97,7 +103,7 @@ impl EdgeEsrVad {
             bail!("EdgeEsr VAD requires a 16000 Hz sample rate")
         }
         super::init_onnx_runtime_api()?;
-        let session = super::load_plain_session(path)?;
+        let session = super::load_plain_session(path, super::default_intra_threads())?;
         let extractor = OriginalFeatureExtractor::with_feature_size(VAD_FEATURE_SIZE)?;
         let endpoint = OriginalVadEndpoint::new(VadEndpointConfig {
             vad_threshold: config.threshold,
@@ -116,6 +122,10 @@ impl EdgeEsrVad {
             endpoint,
             active_segment_start: None,
             active_speech_start: None,
+            stream_started: None,
+            frontend_elapsed: Duration::ZERO,
+            onnx_elapsed: Duration::ZERO,
+            inference_groups: 0,
         };
         runtime.validate_model()?;
         Ok(runtime)
@@ -131,17 +141,23 @@ impl EdgeEsrVad {
         self.endpoint.reset();
         self.active_segment_start = None;
         self.active_speech_start = None;
+        self.stream_started = None;
+        self.frontend_elapsed = Duration::ZERO;
+        self.onnx_elapsed = Duration::ZERO;
+        self.inference_groups = 0;
     }
 
     pub fn push(&mut self, samples: &[i16]) -> Result<Vec<EdgeEsrVadSegment>> {
         if samples.is_empty() {
             return Ok(Vec::new());
         }
+        self.stream_started.get_or_insert_with(Instant::now);
         self.samples.extend_from_slice(samples);
         self.process_available_frames()
     }
 
     pub fn finish(&mut self) -> Result<Vec<EdgeEsrVadSegment>> {
+        let started = *self.stream_started.get_or_insert_with(Instant::now);
         let mut output = self.process_available_frames()?;
         let rounded_frames = self.feature_frames.div_ceil(STACKED_FRAMES) * STACKED_FRAMES;
         if !self.feature_group.is_empty() {
@@ -174,11 +190,25 @@ impl EdgeEsrVad {
         {
             output.push(segment);
         }
+        info!(
+            elapsed_ms = started.elapsed().as_millis(),
+            frontend_ms = self.frontend_elapsed.as_millis(),
+            onnx_ms = self.onnx_elapsed.as_millis(),
+            feature_frames = self.feature_frames,
+            inference_groups = self.inference_groups,
+            segment_count = output.len(),
+            "EdgeEsr VAD completed"
+        );
         Ok(output)
     }
 
     pub fn detected(&self) -> bool {
         self.active_segment_start.is_some()
+    }
+
+    pub fn active_audio_start_sample(&self) -> Option<usize> {
+        self.active_segment_start
+            .map(|frame| frame.max(0) as usize * SAMPLES_PER_FRAME)
     }
 
     fn validate_model(&self) -> Result<()> {
@@ -224,7 +254,9 @@ impl EdgeEsrVad {
         let mut output = Vec::new();
         while self.samples.len().saturating_sub(self.feature_cursor) >= FRAME_LENGTH {
             let frame = &self.samples[self.feature_cursor..self.feature_cursor + FRAME_LENGTH];
+            let frontend_started = Instant::now();
             let q22 = self.extractor.extract_frame_q22(frame)?;
+            self.frontend_elapsed += frontend_started.elapsed();
             self.feature_group
                 .extend(q22.into_iter().map(|value| (value >> 11) as i16));
             let frame_index = self.feature_cursor / FRAME_SHIFT;
@@ -248,6 +280,7 @@ impl EdgeEsrVad {
         } else {
             std::mem::take(&mut self.feature_group)
         };
+        let onnx_started = Instant::now();
         let outputs = self.session.run(ort::inputs! {
             "stacked_features" => Tensor::from_array(([1usize, VAD_INPUT_SIZE], features))?,
             "cell_in" => Tensor::from_array(([1usize, CELL_SIZE], self.neural.cell.clone()))?,
@@ -255,6 +288,14 @@ impl EdgeEsrVad {
             "context_in" => Tensor::from_array(([1usize, CONTEXT_FRAMES, PROJECTION_SIZE], self.neural.context.clone()))?,
             "count_in" => Tensor::from_array(([1usize], self.neural.count.clone()))?,
         })?;
+        let onnx_elapsed = onnx_started.elapsed();
+        self.onnx_elapsed += onnx_elapsed;
+        self.inference_groups += 1;
+        trace!(
+            group = self.inference_groups,
+            elapsed_us = onnx_elapsed.as_micros(),
+            "EdgeEsr VAD inference group completed"
+        );
 
         let (_, cell) = outputs["cell_out"].try_extract_tensor::<f32>()?;
         let (_, projection) = outputs["projection_out"].try_extract_tensor::<f32>()?;
