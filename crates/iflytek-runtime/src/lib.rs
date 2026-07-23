@@ -17,7 +17,10 @@ mod decoder;
 mod encoder;
 mod recognizer;
 mod tensor;
+mod token_timing;
 mod vad;
+
+use token_timing::TokenTimingEstimator;
 
 pub use vad::{EdgeEsrVad, EdgeEsrVadConfig, EdgeEsrVadSegment, EdgeEsrVadSegmentReason};
 
@@ -168,6 +171,7 @@ struct StreamEmissionState {
     partial_count: usize,
     revision_count: usize,
     postprocess_elapsed: std::time::Duration,
+    token_timing: TokenTimingEstimator,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -337,6 +341,7 @@ impl EdgeEsrRuntime {
         let mut pending = Vec::with_capacity(STREAM_ACCEPT_SAMPLES * 2);
         let mut pending_cursor = 0;
         let mut input_samples = 0;
+        let mut accepted_samples = 0;
         let mut emission = StreamEmissionState::default();
 
         loop {
@@ -357,6 +362,7 @@ impl EdgeEsrRuntime {
                     false,
                 )?;
                 pending_cursor += STREAM_ACCEPT_SAMPLES;
+                accepted_samples += STREAM_ACCEPT_SAMPLES;
                 trace!(
                     elapsed_us = chunk_started.elapsed().as_micros(),
                     accepted_samples = STREAM_ACCEPT_SAMPLES,
@@ -365,6 +371,7 @@ impl EdgeEsrRuntime {
                 self.emit_partial_update(
                     &recognizer,
                     &mut emission,
+                    accepted_samples,
                     &mut emit,
                 )?;
             }
@@ -376,18 +383,26 @@ impl EdgeEsrRuntime {
             bail!("EdgeEsr ASR input is empty")
         }
         if pending_cursor < pending.len() {
+            let remaining_samples = pending.len() - pending_cursor;
             recognizer.accept_pcm(&pending[pending_cursor..], false)?;
+            accepted_samples += remaining_samples;
             self.emit_partial_update(
                 &recognizer,
                 &mut emission,
+                accepted_samples,
                 &mut emit,
             )?;
         }
+        debug_assert_eq!(accepted_samples, input_samples);
         recognizer.accept_pcm(&vec![0; SAMPLE_RATE * 4 / 5], true)?;
         let timings = recognizer.timings();
         let postprocess_started = std::time::Instant::now();
-        let transcription = self.recognizer_transcription(&recognizer, true)?;
+        let mut transcription = self.recognizer_transcription(&recognizer, true)?;
         emission.postprocess_elapsed += postprocess_started.elapsed();
+        transcription.token_timestamps = emission.token_timing.update(
+            &transcription.tokens,
+            samples_to_seconds(input_samples),
+        );
         let revision = !emission.last_text.is_empty()
             && !transcription.text.starts_with(&emission.last_text);
         if revision {
@@ -417,6 +432,10 @@ impl EdgeEsrRuntime {
             partial_count = emission.partial_count,
             revision_count = emission.revision_count,
             token_count = transcription.tokens.len(),
+            timed_token_count = transcription
+                .token_timestamps
+                .as_ref()
+                .map_or(0, Vec::len),
             "EdgeEsr transcription completed"
         );
         Ok(transcription)
@@ -426,6 +445,7 @@ impl EdgeEsrRuntime {
         &self,
         recognizer: &recognizer::EdgeEsrRecognizer<'_>,
         emission: &mut StreamEmissionState,
+        accepted_samples: usize,
         emit: &mut Emit,
     ) -> Result<()>
     where
@@ -440,8 +460,12 @@ impl EdgeEsrRuntime {
         emission.last_token_ids.clear();
         emission.last_token_ids.extend_from_slice(path);
         let started = std::time::Instant::now();
-        let transcription = self.recognizer_transcription(recognizer, false)?;
+        let mut transcription = self.recognizer_transcription(recognizer, false)?;
         emission.postprocess_elapsed += started.elapsed();
+        transcription.token_timestamps = emission.token_timing.update(
+            &transcription.tokens,
+            samples_to_seconds(accepted_samples),
+        );
         if transcription.text.is_empty() || transcription.text == emission.last_text {
             return Ok(());
         }
@@ -455,6 +479,7 @@ impl EdgeEsrRuntime {
             sequence = emission.partial_count,
             revision,
             revision_count = emission.revision_count,
+            audio_end_ms = samples_to_milliseconds(accepted_samples),
             text = %transcription.text,
             "EdgeEsr partial transcription updated"
         );
@@ -508,6 +533,14 @@ impl EdgeEsrRuntime {
 }
 
 const STREAM_ACCEPT_SAMPLES: usize = SAMPLE_RATE * 64 / 100;
+
+fn samples_to_seconds(samples: usize) -> f32 {
+    samples as f32 / SAMPLE_RATE as f32
+}
+
+fn samples_to_milliseconds(samples: usize) -> u64 {
+    (samples as u64).saturating_mul(1_000) / SAMPLE_RATE as u64
+}
 
 fn merge_bpe_continuations(tokens: Vec<String>) -> Vec<String> {
     let mut merged: Vec<String> = Vec::new();
