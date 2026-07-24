@@ -123,6 +123,12 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Fetch annotated tag object
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --force origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
+
       - name: Extract manually written tag notes
         shell: bash
         run: |
