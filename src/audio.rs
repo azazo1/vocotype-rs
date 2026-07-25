@@ -11,13 +11,42 @@ use tracing::{info, warn};
 
 use crate::asr::TARGET_SAMPLE_RATE;
 
+#[cfg(target_os = "macos")]
+mod macos;
+
 pub struct AudioInput {
-    stream: Stream,
+    stream: Option<AudioStream>,
     receiver: Receiver<Vec<i16>>,
 }
 
+enum AudioStream {
+    Cpal(Stream),
+    #[cfg(target_os = "macos")]
+    VoiceProcessing(macos::VoiceProcessingInput),
+}
+
 impl AudioInput {
-    pub fn start(device_name: Option<&str>) -> Result<Self> {
+    pub fn start(device_name: Option<&str>, duck_other_audio: bool) -> Result<Self> {
+        if duck_other_audio {
+            #[cfg(target_os = "macos")]
+            match macos::VoiceProcessingInput::start() {
+                Ok((stream, receiver)) => {
+                    return Ok(Self {
+                        stream: Some(AudioStream::VoiceProcessing(stream)),
+                        receiver,
+                    });
+                }
+                Err(error) => {
+                    warn!(%error, "macOS 语音处理音频采集启动失败, 回退 CPAL");
+                }
+            }
+
+        }
+
+        Self::start_cpal(device_name)
+    }
+
+    fn start_cpal(device_name: Option<&str>) -> Result<Self> {
         let host = cpal::default_host();
         let device = select_input_device(&host, device_name)?;
         let device_label = device.to_string();
@@ -99,16 +128,29 @@ impl AudioInput {
             "音频采集已启动"
         );
 
-        Ok(Self { stream, receiver })
+        Ok(Self {
+            stream: Some(AudioStream::Cpal(stream)),
+            receiver,
+        })
     }
 
     pub fn receiver(&self) -> Receiver<Vec<i16>> {
         self.receiver.clone()
     }
 
-    pub fn stop(self) {
-        drop(self.stream);
-        info!("音频采集已停止");
+    pub fn stop(self) {}
+}
+
+impl Drop for AudioInput {
+    fn drop(&mut self) {
+        if let Some(stream) = self.stream.take() {
+            match stream {
+                AudioStream::Cpal(stream) => drop(stream),
+                #[cfg(target_os = "macos")]
+                AudioStream::VoiceProcessing(stream) => drop(stream),
+            }
+            info!("音频采集已停止");
+        }
     }
 }
 

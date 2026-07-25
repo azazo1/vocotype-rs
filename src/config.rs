@@ -1,4 +1,9 @@
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -44,6 +49,7 @@ tail-padding-ms = 180
 min-speech-ms = 240
 max-segment-ms = 15000
 idle-unload-secs = 300
+duck-other-audio = false
 
 [transcribe]
 format = "json"
@@ -203,6 +209,11 @@ pub fn config_schema() -> &'static str {
           "minimum": 0,
           "default": 300,
           "description": "daemon 队列空闲多少秒后卸载 ASR 和 PUNC 模型. 0 表示不自动卸载."
+        },
+        "duck-other-audio": {
+          "type": "boolean",
+          "default": false,
+          "description": "macOS 聆听期间是否降低其他应用的声音."
         }
       }
     },
@@ -239,6 +250,32 @@ pub struct LoadedConfig {
     pub path: PathBuf,
     pub found: bool,
     pub config: AppConfig,
+}
+
+#[derive(Clone, Debug)]
+pub struct DuckOtherAudioPreference {
+    enabled: Arc<AtomicBool>,
+    config_path: Arc<PathBuf>,
+}
+
+impl DuckOtherAudioPreference {
+    pub fn new(config_path: PathBuf, enabled: bool) -> Self {
+        Self {
+            enabled: Arc::new(AtomicBool::new(enabled)),
+            config_path: Arc::new(config_path),
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled.load(Ordering::Acquire)
+    }
+
+    pub fn set_enabled(&self, enabled: bool) -> Result<()> {
+        write_duck_other_audio_setting(&self.config_path, enabled)?;
+        self.enabled.store(enabled, Ordering::Release);
+        info!(enabled, path = %self.config_path.display(), "已保存其他应用音频抑制设置");
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -304,6 +341,8 @@ pub struct DaemonConfig {
     pub max_segment_ms: Option<u32>,
     #[serde(alias = "idle-unload-secs")]
     pub idle_unload_secs: Option<u64>,
+    #[serde(alias = "duck-other-audio")]
+    pub duck_other_audio: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -363,18 +402,64 @@ pub fn default_config_path() -> PathBuf {
         .join(CONFIG_FILE_NAME)
 }
 
+fn write_duck_other_audio_setting(path: &Path, enabled: bool) -> Result<()> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(error).with_context(|| format!("无法读取配置文件: {}", path.display()));
+        }
+    };
+    let mut document = if content.is_empty() {
+        toml_edit::DocumentMut::new()
+    } else {
+        content
+            .parse::<toml_edit::DocumentMut>()
+            .with_context(|| format!("无法解析配置文件: {}", path.display()))?
+    };
+    if !document.contains_key("daemon") {
+        document["daemon"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    let daemon = document["daemon"]
+        .as_table_mut()
+        .context("配置项 daemon 必须是表")?;
+    daemon.remove("duck_other_audio");
+    daemon["duck-other-audio"] = toml_edit::value(enabled);
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("无法创建配置目录: {}", parent.display()))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("无法在配置目录创建临时文件: {}", parent.display()))?;
+    temporary
+        .write_all(document.to_string().as_bytes())
+        .with_context(|| format!("无法写入配置临时文件: {}", path.display()))?;
+    temporary
+        .persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("无法保存配置文件: {}", path.display()))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn default_template_parses() {
-        AppConfig::from_toml(default_config_template()).unwrap();
+        let config = AppConfig::from_toml(default_config_template()).unwrap();
+
+        assert_eq!(config.daemon.duck_other_audio, Some(false));
     }
 
     #[test]
     fn schema_is_valid_json() {
-        serde_json::from_str::<serde_json::Value>(config_schema()).unwrap();
+        let schema = serde_json::from_str::<serde_json::Value>(config_schema()).unwrap();
+
+        assert_eq!(
+            schema.pointer("/properties/daemon/properties/duck-other-audio/type"),
+            Some(&serde_json::Value::String("boolean".to_string()))
+        );
     }
 
     #[test]
@@ -397,6 +482,7 @@ idle-unload-secs = 42
 tail-padding-ms = 250
 hotkey-mode = "toggle"
 end-hotkey = "F3"
+duck-other-audio = true
 
 [transcribe]
 subtitle-max-chars = 32
@@ -417,6 +503,7 @@ subtitle-max-chars = 32
         assert_eq!(config.daemon.tail_padding_ms, Some(250));
         assert_eq!(config.daemon.hotkey_mode.as_deref(), Some("toggle"));
         assert_eq!(config.daemon.end_hotkey.as_deref(), Some("F3"));
+        assert_eq!(config.daemon.duck_other_audio, Some(true));
         assert_eq!(config.transcribe.subtitle_max_chars, Some(32));
     }
 
@@ -475,5 +562,43 @@ output = "/tmp/result.srt"
         );
 
         assert!(config.is_err());
+    }
+
+    #[test]
+    fn updates_ducking_without_replacing_other_config() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"# 保留这条注释.
+model-revision = "revision-a"
+
+[daemon]
+hotkey = "F3"
+duck-other-audio = false
+"#,
+        )
+        .unwrap();
+
+        write_duck_other_audio_setting(&path, true).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let config = AppConfig::from_toml(&content).unwrap();
+        assert!(content.contains("# 保留这条注释."));
+        assert_eq!(config.model_revision.as_deref(), Some("revision-a"));
+        assert_eq!(config.daemon.hotkey.as_deref(), Some("F3"));
+        assert_eq!(config.daemon.duck_other_audio, Some(true));
+    }
+
+    #[test]
+    fn creates_minimal_config_for_ducking_setting() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("nested/config.toml");
+
+        write_duck_other_audio_setting(&path, true).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let config = AppConfig::from_toml(&content).unwrap();
+        assert_eq!(config.daemon.duck_other_audio, Some(true));
     }
 }

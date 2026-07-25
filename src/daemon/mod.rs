@@ -10,6 +10,7 @@ use anyhow::{Context, Result, bail};
 use tracing::error;
 
 use crate::asr::AsrOptions;
+use crate::config::DuckOtherAudioPreference;
 use crate::hotkey::{HotkeyConfig, HotkeyManager};
 use crate::inject::InjectMethod;
 use crate::models::ModelStore;
@@ -56,10 +57,16 @@ pub struct DaemonOptions {
     pub min_speech_ms: u32,
     pub max_segment_ms: u32,
     pub idle_unload_secs: u64,
+    pub duck_other_audio: DuckOtherAudioPreference,
     pub asr_options: AsrOptions,
 }
 
 pub async fn run_daemon(store: ModelStore, options: DaemonOptions) -> Result<()> {
+    #[cfg(not(target_os = "macos"))]
+    if options.duck_other_audio.enabled() {
+        tracing::warn!("当前平台不支持降低其他应用音量, 继续使用普通录音");
+    }
+
     store.paths.ensure_dirs()?;
     if let Err(error) = store.verify_required_for(options.asr_options.backend) {
         error!(%error, "模型缺失");
@@ -70,7 +77,7 @@ pub async fn run_daemon(store: ModelStore, options: DaemonOptions) -> Result<()>
         return Err(error);
     }
 
-    let (overlay, overlay_runner) = create_overlay();
+    let (overlay, overlay_runner) = create_overlay(options.duck_other_audio.clone());
     overlay.idle();
     let hotkey_cfg = HotkeyConfig {
         key: options.hotkey.clone(),

@@ -14,6 +14,7 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use tracing::{info, warn};
 
 use app::OverlayApp;
+use crate::config::DuckOtherAudioPreference;
 
 pub use state::{OverlayMode, OverlayState, StreamingTranscript};
 
@@ -25,6 +26,7 @@ pub struct OverlayHandle {
 pub struct OverlayRunner {
     state: Arc<Mutex<OverlayState>>,
     receiver: Receiver<OverlayState>,
+    duck_other_audio: DuckOtherAudioPreference,
 }
 
 impl OverlayHandle {
@@ -37,12 +39,16 @@ impl OverlayHandle {
     }
 }
 
-pub fn create() -> (OverlayHandle, OverlayRunner) {
+pub fn create(duck_other_audio: DuckOtherAudioPreference) -> (OverlayHandle, OverlayRunner) {
     let (sender, receiver) = unbounded::<OverlayState>();
     let state = Arc::new(Mutex::new(OverlayState::default()));
     (
         OverlayHandle { sender },
-        OverlayRunner { state, receiver },
+        OverlayRunner {
+            state,
+            receiver,
+            duck_other_audio,
+        },
     )
 }
 
@@ -56,6 +62,7 @@ impl OverlayRunner {
 
         let app_state = self.state;
         let receiver = self.receiver;
+        let duck_other_audio = self.duck_other_audio;
         info!("悬浮窗事件循环已启动");
         eframe::run_native(
             "VocoType",
@@ -63,7 +70,7 @@ impl OverlayRunner {
             Box::new(move |cc| {
                 fonts::install(&cc.egui_ctx);
                 platform::configure_window(cc);
-                let status_item = platform::install_status_item();
+                let status_item = platform::install_status_item(duck_other_audio);
                 Ok(Box::new(OverlayApp::new(app_state, receiver, status_item)))
             }),
         )

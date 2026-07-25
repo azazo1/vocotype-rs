@@ -14,6 +14,8 @@ RESOURCES_DIR="$CONTENTS_DIR/Resources"
 ICON_NAME="app-icon"
 ICON_FILE="$ICON_NAME.icns"
 ICON_SOURCE="assets/$ICON_FILE"
+MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-14.0}"
+export MACOSX_DEPLOYMENT_TARGET
 
 cargo build --locked --release --bin "$BIN_NAME"
 
@@ -51,7 +53,7 @@ cat > "$CONTENTS_DIR/Info.plist" <<PLIST
     <key>CFBundleVersion</key>
     <string>$APP_VERSION</string>
     <key>LSMinimumSystemVersion</key>
-    <string>13.0</string>
+    <string>14.0</string>
     <key>LSUIElement</key>
     <true/>
     <key>NSHighResolutionCapable</key>

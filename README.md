@@ -16,6 +16,7 @@ VocoType 是一个本地语音转写和文本注入工具. 默认使用纯 Rust 
 - 支持用户词汇表, hotwords 和逐字母短语改写.
 - 可从 Rime 英文 .dict.yaml 导入热词.
 - 空闲时可自动卸载 ASR 和 PUNC 模型, 降低内存占用.
+- macOS 14+ 可在聆听期间自动降低其他应用音量.
 
 ## 快速开始
 
@@ -61,6 +62,14 @@ vocotype daemon --hotkey F2
 ```
 
 默认模式是 `pressed`, 按住热键录音, 松开后停止并转写.
+
+macOS app 需要 macOS 14 或更高版本. 可以从状态栏菜单开启"聆听时降低其他应用音量", 也可以使用命令行:
+
+```shell
+vocotype daemon --duck-other-audio
+```
+
+该设置只影响下一次录音, 不会重启正在进行的音频流. 录音和尾部音频采集结束后, 其他应用音量会自动恢复.
 
 ## 热键模式
 
@@ -172,6 +181,15 @@ vocotype config schema
 ```shell
 vocotype config doctor
 ```
+
+在 macOS 14+ 启用聆听音频抑制:
+
+```toml
+[daemon]
+duck-other-audio = true
+```
+
+也可以使用 `VOCOTYPE_DUCK_OTHER_AUDIO=true` 覆盖当前启动的配置. 功能默认关闭, 非 macOS 平台会继续使用普通录音.
 
 启用后处理英文标点模式:
 

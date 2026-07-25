@@ -31,7 +31,9 @@ pub(crate) fn configure_window(_cc: &eframe::CreationContext<'_>) {}
 pub(crate) struct StatusItem;
 
 #[cfg(not(target_os = "macos"))]
-pub(crate) fn install_status_item() -> Option<StatusItem> {
+pub(crate) fn install_status_item(
+    _duck_other_audio: crate::config::DuckOtherAudioPreference,
+) -> Option<StatusItem> {
     None
 }
 

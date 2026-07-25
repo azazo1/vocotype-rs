@@ -9,7 +9,10 @@ use clap_complete::{Shell, generate};
 use crate::asr::{AsrEngine, AsrOptions};
 use crate::asr_backend::AsrBackend;
 use crate::audio::list_input_devices;
-use crate::config::{AppConfig, config_schema, default_config_path, default_config_template};
+use crate::config::{
+    AppConfig, DuckOtherAudioPreference, config_schema, default_config_path,
+    default_config_template,
+};
 use crate::daemon::{DaemonOptions, HotkeyMode, run_daemon};
 use crate::dict::{
     DEFAULT_HOTWORDS_SCORE, SpeechDictionary, default_dict_template, write_dict_doctor,
@@ -189,6 +192,18 @@ pub struct DaemonArgs {
         long_help = "daemon 队列空闲达到该秒数后卸载 ASR 和 PUNC 模型以降低内存占用. 设置为 0 表示不自动卸载."
     )]
     pub idle_unload_secs: u64,
+
+    #[arg(
+        long,
+        env = "VOCOTYPE_DUCK_OTHER_AUDIO",
+        default_value_t = false,
+        default_missing_value = "true",
+        num_args = 0..=1,
+        require_equals = true,
+        help = "聆听期间降低其他应用的声音",
+        long_help = "聆听期间使用 macOS 语音处理降低其他应用的声音. 使用 --duck-other-audio=false 可显式关闭."
+    )]
+    pub duck_other_audio: bool,
 }
 
 #[derive(Args, Debug)]
@@ -390,6 +405,10 @@ pub async fn run() -> Result<()> {
                 min_speech_ms: args.min_speech_ms,
                 max_segment_ms: args.max_segment_ms,
                 idle_unload_secs: args.idle_unload_secs,
+                duck_other_audio: DuckOtherAudioPreference::new(
+                    config_path.unwrap_or_else(default_config_path),
+                    args.duck_other_audio,
+                ),
                 asr_options,
             };
             run_daemon(store, daemon).await
@@ -725,6 +744,12 @@ fn write_daemon_config_status(writer: &mut impl Write, config: &AppConfig) -> Re
     write_value_status_without_source(writer, "min-speech-ms", daemon.min_speech_ms)?;
     write_value_status_without_source(writer, "max-segment-ms", daemon.max_segment_ms)?;
     write_value_status_without_source(writer, "idle-unload-secs", daemon.idle_unload_secs)?;
+    write_env_value_status(
+        writer,
+        "duck-other-audio",
+        daemon.duck_other_audio,
+        "VOCOTYPE_DUCK_OTHER_AUDIO",
+    )?;
     Ok(())
 }
 
@@ -887,6 +912,11 @@ fn apply_daemon_config(args: &mut DaemonArgs, matches: &ArgMatches, config: &App
         matches.value_source("idle_unload_secs"),
         daemon.idle_unload_secs,
     );
+    args.duck_other_audio = merge_value(
+        args.duck_other_audio,
+        matches.value_source("duck_other_audio"),
+        daemon.duck_other_audio,
+    );
 }
 
 fn apply_transcribe_config(
@@ -949,8 +979,46 @@ fn should_use_config(source: Option<ValueSource>) -> bool {
 
 #[cfg(test)]
 mod config_tests {
+    use std::sync::Mutex;
+
     use super::*;
     use crate::config::{DaemonConfig, PostProcessingConfig, TranscribeConfig};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn daemon_args_with_env(value: &str, configured: bool) -> DaemonArgs {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let previous = std::env::var_os("VOCOTYPE_DUCK_OTHER_AUDIO");
+        // SAFETY: 此测试用互斥锁串行修改该环境变量, 并在解析后恢复原值.
+        unsafe {
+            std::env::set_var("VOCOTYPE_DUCK_OTHER_AUDIO", value);
+        }
+        let parsed = Cli::command()
+            .try_get_matches_from(["vocotype", "daemon"])
+            .and_then(|matches| Cli::from_arg_matches(&matches).map(|cli| (cli, matches)));
+        // SAFETY: 此测试仍持有环境变量互斥锁.
+        unsafe {
+            if let Some(value) = previous {
+                std::env::set_var("VOCOTYPE_DUCK_OTHER_AUDIO", value);
+            } else {
+                std::env::remove_var("VOCOTYPE_DUCK_OTHER_AUDIO");
+            }
+        }
+        let (mut cli, matches) = parsed.unwrap();
+        let config = AppConfig {
+            daemon: DaemonConfig {
+                duck_other_audio: Some(configured),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        apply_config(&mut cli, &matches, &config).unwrap();
+
+        let Command::Daemon(args) = cli.command else {
+            panic!("expected daemon command");
+        };
+        args
+    }
 
     #[test]
     fn cli_defaults_to_iflytek_backend() {
@@ -1002,6 +1070,7 @@ mod config_tests {
         let report = String::from_utf8(output).unwrap();
         assert!(report.contains("状态:"));
         assert!(report.contains("解析: 成功"));
+        assert!(report.contains("duck-other-audio"));
     }
 
     #[test]
@@ -1017,6 +1086,7 @@ mod config_tests {
                 end_hotkey: Some("F4".to_string()),
                 append_newline: Some(true),
                 idle_unload_secs: Some(0),
+                duck_other_audio: Some(true),
                 ..Default::default()
             },
             post_processing: PostProcessingConfig {
@@ -1037,6 +1107,7 @@ mod config_tests {
         assert!(args.append_newline);
         assert!(args.strip_trailing_period);
         assert_eq!(args.idle_unload_secs, 0);
+        assert!(args.duck_other_audio);
     }
 
     #[test]
@@ -1084,6 +1155,42 @@ mod config_tests {
         };
         assert_eq!(args.hotkey, "F4");
         assert_eq!(args.idle_unload_secs, 12);
+    }
+
+    #[test]
+    fn command_line_can_disable_configured_audio_ducking() {
+        let matches = Cli::command()
+            .try_get_matches_from(["vocotype", "daemon", "--duck-other-audio=false"])
+            .unwrap();
+        let mut cli = Cli::from_arg_matches(&matches).unwrap();
+        let config = AppConfig {
+            daemon: DaemonConfig {
+                duck_other_audio: Some(true),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        apply_config(&mut cli, &matches, &config).unwrap();
+
+        let Command::Daemon(args) = cli.command else {
+            panic!("expected daemon command");
+        };
+        assert!(!args.duck_other_audio);
+    }
+
+    #[test]
+    fn environment_can_enable_audio_ducking() {
+        let args = daemon_args_with_env("true", false);
+
+        assert!(args.duck_other_audio);
+    }
+
+    #[test]
+    fn environment_can_disable_audio_ducking() {
+        let args = daemon_args_with_env("false", true);
+
+        assert!(!args.duck_other_audio);
     }
 
     #[test]

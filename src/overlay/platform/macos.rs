@@ -1,12 +1,49 @@
+use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send};
 use objc2::rc::Retained;
+use objc2_foundation::NSObject;
 use tracing::{info, warn};
 
+use crate::config::DuckOtherAudioPreference;
+
 use super::ScreenRect;
+
+#[derive(Debug)]
+struct DuckOtherAudioMenuTargetIvars {
+    preference: DuckOtherAudioPreference,
+}
+
+define_class!(
+    // SAFETY: NSObject 没有额外的子类约束, 此类型只在主线程使用.
+    #[unsafe(super = NSObject)]
+    #[thread_kind = MainThreadOnly]
+    #[ivars = DuckOtherAudioMenuTargetIvars]
+    struct DuckOtherAudioMenuTarget;
+
+    impl DuckOtherAudioMenuTarget {
+        // SAFETY: 此方法签名与 Objective-C action 方法一致.
+        #[unsafe(method(toggleDuckOtherAudio:))]
+        fn toggle_duck_other_audio(&self, sender: &objc2_app_kit::NSMenuItem) {
+            let enabled = !self.ivars().preference.enabled();
+            match self.ivars().preference.set_enabled(enabled) {
+                Ok(()) => {
+                    sender.setState(ducking_menu_state(enabled));
+                    info!(enabled, "状态栏已更新其他应用音频抑制设置");
+                }
+                Err(error) => {
+                    sender.setState(ducking_menu_state(!enabled));
+                    warn!(%error, enabled, "无法保存其他应用音频抑制设置");
+                }
+            }
+        }
+    }
+);
 
 pub(crate) struct StatusItem {
     _status_bar: Retained<objc2_app_kit::NSStatusBar>,
     _item: Retained<objc2_app_kit::NSStatusItem>,
     _menu: Retained<objc2_app_kit::NSMenu>,
+    _ducking_item: Retained<objc2_app_kit::NSMenuItem>,
+    _ducking_target: Retained<DuckOtherAudioMenuTarget>,
 }
 
 pub(crate) fn configure_native_options(native_options: &mut eframe::NativeOptions) {
@@ -17,9 +54,11 @@ pub(crate) fn configure_native_options(native_options: &mut eframe::NativeOption
     }));
 }
 
-pub(crate) fn install_status_item() -> Option<StatusItem> {
+pub(crate) fn install_status_item(
+    duck_other_audio: DuckOtherAudioPreference,
+) -> Option<StatusItem> {
     let mtm = objc2::MainThreadMarker::new()?;
-    let status_item = StatusItem::new(mtm);
+    let status_item = StatusItem::new(mtm, duck_other_audio);
     info!("macOS 状态栏图标已创建");
     Some(status_item)
 }
@@ -91,7 +130,10 @@ fn configure_window_inner(cc: &eframe::CreationContext<'_>) -> Result<(), String
 }
 
 impl StatusItem {
-    fn new(mtm: objc2::MainThreadMarker) -> Self {
+    fn new(
+        mtm: objc2::MainThreadMarker,
+        duck_other_audio: DuckOtherAudioPreference,
+    ) -> Self {
         use objc2::runtime::AnyObject;
         use objc2::sel;
         use objc2_app_kit::{
@@ -126,6 +168,23 @@ impl StatusItem {
         };
         running_item.setEnabled(false);
         menu.addItem(&running_item);
+
+        let ducking_target = DuckOtherAudioMenuTarget::new(mtm, duck_other_audio.clone());
+        let ducking_title = NSString::from_str("聆听时降低其他应用音量");
+        let ducking_item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                mtm.alloc(),
+                &ducking_title,
+                Some(sel!(toggleDuckOtherAudio:)),
+                &empty_key,
+            )
+        };
+        ducking_item.setState(ducking_menu_state(duck_other_audio.enabled()));
+        let ducking_target_object: &AnyObject = ducking_target.as_ref();
+        unsafe {
+            ducking_item.setTarget(Some(ducking_target_object));
+        }
+        menu.addItem(&ducking_item);
         menu.addItem(&NSMenuItem::separatorItem(mtm));
 
         let quit_title = NSString::from_str("退出 VocoType");
@@ -149,6 +208,26 @@ impl StatusItem {
             _status_bar: status_bar,
             _item: item,
             _menu: menu,
+            _ducking_item: ducking_item,
+            _ducking_target: ducking_target,
         }
+    }
+}
+
+impl DuckOtherAudioMenuTarget {
+    fn new(
+        mtm: objc2::MainThreadMarker,
+        preference: DuckOtherAudioPreference,
+    ) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(DuckOtherAudioMenuTargetIvars { preference });
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
+fn ducking_menu_state(enabled: bool) -> objc2_app_kit::NSControlStateValue {
+    if enabled {
+        objc2_app_kit::NSControlStateValueOn
+    } else {
+        objc2_app_kit::NSControlStateValueOff
     }
 }

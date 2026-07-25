@@ -7,6 +7,7 @@ use tracing::{debug, info, warn};
 use crate::asr_backend::AsrBackend;
 use crate::audio::AudioInput;
 use crate::dataset::DatasetRecorder;
+use crate::config::DuckOtherAudioPreference;
 use crate::hotkey::{HotkeyAction, HotkeyEvent, HotkeyManager, HotkeyMatcher, HotkeyRole};
 use crate::models::ModelStore;
 use crate::overlay::{OverlayHandle, OverlayMode};
@@ -72,6 +73,7 @@ pub(super) fn run_daemon_loop(
         hotkey_mode = options.hotkey_mode.label(),
         hotkey = %hotkeys.trigger_label(),
         end_hotkey = hotkeys.end_label().as_deref().unwrap_or(""),
+        duck_other_audio = options.duck_other_audio.enabled(),
         "daemon 已启动, 等待热键"
     );
 
@@ -90,6 +92,7 @@ pub(super) fn run_daemon_loop(
                             state: &state,
                             overlay: &overlay,
                             tail_padding_ms: options.tail_padding_ms,
+                            duck_other_audio: &options.duck_other_audio,
                         },
                     )?;
                 }
@@ -206,6 +209,7 @@ struct HotkeyRuntime<'a> {
     state: &'a SharedRuntimeState,
     overlay: &'a OverlayHandle,
     tail_padding_ms: u32,
+    duck_other_audio: &'a DuckOtherAudioPreference,
 }
 
 struct CaptureRuntime {
@@ -246,6 +250,7 @@ fn handle_hotkey_event(
                 ctx.task_tx,
                 ctx.state,
                 ctx.overlay,
+                ctx.duck_other_audio.enabled(),
             ),
             HotkeyEvent {
                 role: HotkeyRole::Trigger,
@@ -283,6 +288,7 @@ fn handle_hotkey_event(
                 ctx.task_tx,
                 ctx.state,
                 ctx.overlay,
+                ctx.duck_other_audio.enabled(),
             ),
             _ => Ok(()),
         },
@@ -296,6 +302,7 @@ fn handle_hotkey_event(
                 ctx.task_tx,
                 ctx.state,
                 ctx.overlay,
+                ctx.duck_other_audio.enabled(),
             ),
             HotkeyEvent {
                 role: HotkeyRole::End,
@@ -320,12 +327,13 @@ fn begin_capture(
     task_tx: &Sender<TranscriptionTask>,
     state: &SharedRuntimeState,
     overlay: &OverlayHandle,
+    duck_other_audio: bool,
 ) -> Result<()> {
     if capture.capturing {
         return Ok(());
     }
     debug!("开始录音");
-    let input = AudioInput::start(None)?;
+    let input = AudioInput::start(None, duck_other_audio)?;
     capture.audio_rx = Some(input.receiver());
     capture.audio_input = Some(input);
     if let Some(segmenter) = segmenter {
