@@ -24,7 +24,7 @@ use crate::subtitle::{SubtitleOptions, transcribe_srt};
 #[derive(Parser, Debug)]
 #[command(
     name = "vocotype",
-    version,
+    version = env!("VOCOTYPE_BUILD_VERSION"),
     about = "本地语音转写和文本注入工具",
     long_about = "VocoType 使用本地 sherpa-onnx 或讯飞 EdgeEsr 模型完成录音转写, VAD 分段, 标点恢复, 文本注入和 SRT 字幕输出."
 )]

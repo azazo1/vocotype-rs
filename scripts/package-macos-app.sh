@@ -3,7 +3,7 @@ set -eu
 
 APP_NAME="VocoType"
 BUNDLE_ID="${BUNDLE_ID:-dev.vocotype.app}"
-APP_VERSION="${APP_VERSION:-0.1.0}"
+APP_VERSION="${APP_VERSION:-$(cargo metadata --locked --no-deps --format-version 1 | jq -er '.packages[] | select(.name == "vocotype-rs") | .version')}"
 BIN_NAME="vocotype"
 TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 APP_ROOT="$TARGET_DIR/macos-app"
