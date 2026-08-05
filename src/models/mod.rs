@@ -228,7 +228,12 @@ impl ModelStore {
 
     pub fn iflytek_model_files(&self) -> Result<iflytek_runtime::EdgeEsrModelFiles> {
         let dir = self.model_dir(ModelKind::Iflytek);
-        let files = iflytek_runtime::EdgeEsrModelFiles::from_dir(&dir)?;
+        // 正常加载只检查文件是否存在, 完整性校验由 download/doctor 负责.
+        iflytek_runtime::EdgeEsrModelFiles::from_dir(&dir)
+    }
+
+    pub fn verified_iflytek_model_files(&self) -> Result<iflytek_runtime::EdgeEsrModelFiles> {
+        let files = self.iflytek_model_files()?;
         self.verify_iflytek_checksums(&files)?;
         Ok(files)
     }

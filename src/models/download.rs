@@ -132,6 +132,7 @@ impl ModelStore {
             warn!(path = %target_dir.display(), missing = ?missing, "讯飞模型解压后校验失败");
             bail!("讯飞模型下载不完整或校验失败")
         }
+        self.verified_iflytek_model_files()?;
         info!(path = %target_dir.display(), "讯飞模型下载完成");
         Ok(())
     }

@@ -65,6 +65,7 @@ pub fn loadability_report_for(
         },
     )?;
     if backend == AsrBackend::Iflytek {
+        store.verified_iflytek_model_files()?;
         writeln!(writer, "iflytek_asr=loadable")?;
         writeln!(writer, "iflytek_vad=loadable")?;
         writeln!(writer, "iflytek_custom_op_domain={}", iflytek_core::CUSTOM_OP_DOMAIN)?;

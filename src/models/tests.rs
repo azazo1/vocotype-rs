@@ -41,6 +41,25 @@ fn default_missing_models_reports_required_kinds() {
 }
 
 #[test]
+fn iflytek_normal_use_only_requires_file_existence() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = ModelStore::new(&ModelOptions {
+        model_dir: Some(dir.path().join("models")),
+        model_cache_dir: Some(dir.path().join("cache")),
+        revision: DEFAULT_REVISION.to_string(),
+    });
+    let iflytek_dir = store.model_dir(ModelKind::Iflytek);
+    std::fs::create_dir_all(&iflytek_dir).unwrap();
+    for name in iflytek_runtime::REQUIRED_MODEL_FILES {
+        std::fs::write(iflytek_dir.join(name), []).unwrap();
+    }
+
+    assert!(store.model_ready(ModelKind::Iflytek));
+    assert!(store.iflytek_model_files().is_ok());
+    assert!(store.verified_iflytek_model_files().is_err());
+}
+
+#[test]
 fn asr_ready_requires_onnx_and_tokens() {
     let dir = tempfile::tempdir().unwrap();
     let store = ModelStore::new(&ModelOptions {
