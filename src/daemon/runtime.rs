@@ -333,7 +333,17 @@ fn begin_capture(
         return Ok(());
     }
     debug!("开始录音");
-    let input = AudioInput::start(None, duck_other_audio)?;
+    begin_recording_session(state);
+    overlay.set(overlay_state(state, OverlayMode::Starting));
+    let input = AudioInput::start(None, duck_other_audio).map_err(|error| {
+        overlay.set(overlay_state(
+            state,
+            OverlayMode::Error {
+                message: format!("音频采集启动失败: {}", error),
+            },
+        ));
+        error
+    })?;
     capture.audio_rx = Some(input.receiver());
     capture.audio_input = Some(input);
     if let Some(segmenter) = segmenter {
@@ -346,7 +356,6 @@ fn begin_capture(
     };
     capture.capturing = true;
     capture.last_frame_at = Instant::now();
-    begin_recording_session(state);
     overlay.set(overlay_state(state, OverlayMode::Recording { level: 0.0 }));
     Ok(())
 }

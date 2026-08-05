@@ -1,6 +1,7 @@
 #[derive(Clone, Debug)]
 pub enum OverlayMode {
     Idle,
+    Starting,
     Recording { level: f32 },
     Silence { pending: usize },
     Transcribing { pending: usize },
@@ -13,6 +14,7 @@ impl OverlayMode {
     pub(crate) fn title(&self) -> &'static str {
         match self {
             Self::Idle => "VocoType",
+            Self::Starting => "正在启动",
             Self::Recording { .. } => "正在录音",
             Self::Silence { .. } => "等待语音",
             Self::Transcribing { .. } => "正在转写",
@@ -25,6 +27,7 @@ impl OverlayMode {
     pub(crate) fn detail(&self) -> String {
         match self {
             Self::Idle => "按住热键开始本地转写".to_string(),
+            Self::Starting => "麦克风准备中".to_string(),
             Self::Recording { .. } => "继续说话, 停顿后会自动提交当前片段".to_string(),
             Self::Silence { pending } => format!("检测到停顿, 队列中有 {} 个片段", pending),
             Self::Transcribing { pending } => format!("后台转写中, 队列剩余 {}", pending),
