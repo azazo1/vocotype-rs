@@ -20,7 +20,7 @@ build-icon:
 # 根据当前平台生成发布产物.
 [macos]
 dist:
-    sh scripts/package-macos-app.sh
+    sh scripts/dist-macos.sh
 
 # just run-daemon --hotkey F2
 # 启动 daemon.

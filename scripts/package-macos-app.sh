@@ -17,8 +17,10 @@ ICON_SOURCE="assets/$ICON_FILE"
 MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-14.0}"
 export MACOSX_DEPLOYMENT_TARGET
 
+printf '正在构建 %s release 二进制...\n' "$BIN_NAME"
 cargo build --locked --release --bin "$BIN_NAME"
 
+printf '正在组装 %s.app...\n' "$APP_NAME"
 rm -rf "$APP_DIR"
 mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
 cp "$TARGET_DIR/release/$BIN_NAME" "$MACOS_DIR/$BIN_NAME"
@@ -65,6 +67,7 @@ cat > "$CONTENTS_DIR/Info.plist" <<PLIST
 PLIST
 
 if command -v codesign >/dev/null 2>&1; then
+    printf '正在对 %s.app 做 ad-hoc 签名...\n' "$APP_NAME"
     codesign --force --deep --sign - "$APP_DIR"
 fi
 

@@ -19,7 +19,7 @@ fn run_git(args: &[&str]) -> Option<String> {
 fn parse_describe(describe: &str) -> Option<(String, u64, String)> {
     let hash_start = describe.rfind("-g")?;
     let hash = &describe[hash_start + 2..];
-    if hash.len() < 6 || !hash.chars().all(|character| character.is_ascii_hexdigit()) {
+    if hash.len() < 7 || !hash.chars().all(|character| character.is_ascii_hexdigit()) {
         return None;
     }
 
@@ -38,9 +38,14 @@ fn git_commit_version(package_version: &str) -> Option<String> {
         "--always",
         "--long",
         "--dirty",
-        "--abbrev=6",
+        "--abbrev=7",
     ])?;
-    let short_hash = run_git(&["rev-parse", "--short=6", "HEAD"])?;
+    let full_hash = run_git(&["rev-parse", "HEAD"])?;
+    if full_hash.len() < 7 || !full_hash[..7].chars().all(|character| character.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    let short_hash = full_hash[..7].to_string();
     let dirty = describe.ends_with("-dirty");
     let clean = describe.strip_suffix("-dirty").unwrap_or(&describe);
 

@@ -31,6 +31,7 @@ jobs:
       source_ref: ${{ steps.release_context.outputs.source_ref }}
       package_version: ${{ steps.package_version.outputs.package_version }}
       version: ${{ steps.release_version.outputs.version }}
+      build_version: ${{ steps.build_version.outputs.build_version }}
     steps:
       - name: Parse release context
         id: release_context
@@ -103,6 +104,23 @@ jobs:
 
           echo "version=$PACKAGE_VERSION" >> "$GITHUB_OUTPUT"
 
+      - name: Resolve build version
+        id: build_version
+        env:
+          IS_RELEASE: ${{ steps.release_context.outputs.is_release }}
+          PACKAGE_VERSION: ${{ steps.package_version.outputs.package_version }}
+          RELEASE_VERSION: ${{ steps.release_version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$IS_RELEASE" == "true" ]]; then
+            build_version="$RELEASE_VERSION"
+          else
+            short_hash="$(git rev-parse HEAD | cut -c1-7)"
+            build_version="${PACKAGE_VERSION}-${short_hash}"
+          fi
+          echo "build_version=$build_version" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build ${{ matrix.platform }} ${{ matrix.arch }}
     needs: version
@@ -114,9 +132,10 @@ jobs:
           - runner: macos-15
             platform: macos
             arch: aarch64
-            archive_extension: tar.gz
+            archive_extension: dmg
     env:
       PACKAGE_VERSION: ${{ needs.version.outputs.package_version }}
+      BUILD_VERSION: ${{ needs.version.outputs.build_version }}
       IS_RELEASE: ${{ needs.version.outputs.is_release }}
       MACOSX_DEPLOYMENT_TARGET: "14.0"
     steps:
@@ -125,8 +144,14 @@ jobs:
         with:
           ref: ${{ needs.version.outputs.source_ref }}
           fetch-depth: 0
+          fetch-tags: true
 
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          prefix-key: vocotype-${{ matrix.platform }}-${{ matrix.arch }}
 
       - name: Verify native architecture
         shell: bash
@@ -137,56 +162,65 @@ jobs:
             exit 1
           fi
 
-      - name: Build binary for branch and PR
-        if: ${{ github.event_name != 'workflow_dispatch' && needs.version.outputs.is_release != 'true' }}
-        shell: bash
-        run: cargo build --locked --bin vocotype
-
-      - name: Build macOS app bundle
-        if: ${{ github.event_name == 'workflow_dispatch' || needs.version.outputs.is_release == 'true' }}
+      - name: Build macOS distribution
         shell: bash
         env:
           APP_VERSION: ${{ needs.version.outputs.package_version }}
+          BUILD_VERSION: ${{ needs.version.outputs.build_version }}
         run: |
           set -euo pipefail
-          sh scripts/package-macos-app.sh
+          sh scripts/dist-macos.sh
 
       - name: Smoke test application binary
-        if: ${{ github.event_name == 'workflow_dispatch' || needs.version.outputs.is_release == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
           binary="target/macos-app/VocoType.app/Contents/MacOS/vocotype"
           test -x "$binary"
+          file "$binary" | grep -q 'Mach-O'
           version_output="$("$binary" --version)"
-          if [[ "$version_output" != "vocotype v"* ]]; then
-            printf 'CLI 版本输出不符合约定: %s\n' "$version_output" >&2
-            exit 1
-          fi
           if [[ "$IS_RELEASE" == "true" ]]; then
             expected="vocotype v${PACKAGE_VERSION}"
             if [[ "$version_output" != "$expected" ]]; then
               printf 'CLI 版本输出 %s, 预期 %s\n' "$version_output" "$expected" >&2
               exit 1
             fi
+          else
+            if [[ "$version_output" == *"^"* ]]; then
+              printf 'CI 构建不应包含脏工作区标记: %s\n' "$version_output" >&2
+              exit 1
+            fi
+            if [[ "$version_output" != "vocotype v${PACKAGE_VERSION}" &&
+                  ! "$version_output" =~ ^vocotype\ v.+-[0-9a-f]{7,}$ ]]; then
+              printf 'CLI 版本输出不符合约定: %s\n' "$version_output" >&2
+              exit 1
+            fi
           fi
 
-      - name: Archive macOS ARM64 application
-        if: ${{ github.event_name == 'workflow_dispatch' || needs.version.outputs.is_release == 'true' }}
+      - name: Validate dmg contents
         shell: bash
         run: |
           set -euo pipefail
-          archive="vocotype-${PACKAGE_VERSION}-${{ matrix.platform }}-${{ matrix.arch }}.${{ matrix.archive_extension }}"
-          mkdir -p dist
-          tar -C target/macos-app -czf "dist/$archive" VocoType.app
-          test -s "dist/$archive"
+          dmg="dist/vocotype-${BUILD_VERSION}-${{ matrix.platform }}-${{ matrix.arch }}.${{ matrix.archive_extension }}"
+          test -s "$dmg"
+          mount_point="$(mktemp -d)"
+          hdiutil attach -nobrowse -readonly -mountpoint "$mount_point" "$dmg"
+          trap 'hdiutil detach "$mount_point" >/dev/null 2>&1 || true' EXIT
+
+          test -L "$mount_point/Applications"
+          test -d "$mount_point/VocoType.app"
+          applications_target="$(readlink "$mount_point/Applications")"
+          if [[ "$applications_target" != "/Applications" ]]; then
+            printf 'Applications 链接目标应为 /Applications, 实际为 %s\n' "$applications_target" >&2
+            exit 1
+          fi
+          test -x "$mount_point/VocoType.app/Contents/MacOS/vocotype"
 
       - name: Upload artifact
-        if: ${{ github.event_name == 'workflow_dispatch' || needs.version.outputs.is_release == 'true' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: vocotype-${{ matrix.platform }}-${{ matrix.arch }}
-          path: dist/vocotype-${{ needs.version.outputs.package_version }}-${{ matrix.platform }}-${{ matrix.arch }}.${{ matrix.archive_extension }}
+          name: vocotype-${{ needs.version.outputs.build_version }}-${{ matrix.platform }}-${{ matrix.arch }}
+          path: dist/vocotype-${{ needs.version.outputs.build_version }}-${{ matrix.platform }}-${{ matrix.arch }}.${{ matrix.archive_extension }}
           if-no-files-found: error
           retention-days: 7
 
@@ -289,7 +323,7 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
           cd release-artifacts
-          archives=(vocotype-*.tar.gz)
+          archives=(vocotype-*.dmg)
           if (( ${#archives[@]} != 1 )); then
             printf '预期 1 个归档, 实际找到 %s 个\n' "${#archives[@]}" >&2
             exit 1
@@ -299,7 +333,7 @@ jobs:
           test -s SHA256SUMS
           cd ..
 
-          assets=(release-artifacts/vocotype-*.tar.gz release-artifacts/SHA256SUMS)
+          assets=(release-artifacts/vocotype-*.dmg release-artifacts/SHA256SUMS)
           if (( ${#assets[@]} != 2 )); then
             printf '预期 2 个发布文件, 实际找到 %s 个\n' "${#assets[@]}" >&2
             exit 1
@@ -313,7 +347,7 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          assets=(release-artifacts/vocotype-*.tar.gz release-artifacts/SHA256SUMS)
+          assets=(release-artifacts/vocotype-*.dmg release-artifacts/SHA256SUMS)
           if (( ${#assets[@]} != 2 )); then
             printf '预期 2 个发布文件, 实际找到 %s 个\n' "${#assets[@]}" >&2
             exit 1
