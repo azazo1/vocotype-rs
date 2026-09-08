@@ -120,10 +120,7 @@ pub(super) fn run_daemon_loop(
                         }
                         Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                             if capture.last_frame_at.elapsed() > Duration::from_millis(options.end_silence_ms as u64) {
-                                overlay.set(overlay_state(
-                                    &state,
-                                    OverlayMode::Silence { pending: pending_count(&state) },
-                                ));
+                                report_capture_silence(&mut capture, &state, &overlay);
                             }
                         }
                         Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
@@ -154,6 +151,14 @@ fn process_audio_frame(
     capture: &mut CaptureRuntime,
 ) -> Result<()> {
     capture.last_frame_at = Instant::now();
+    capture.received_frames = capture.received_frames.saturating_add(1);
+    if capture.received_frames == 1 {
+        info!(
+            samples = frame.len(),
+            level = frame_level(&frame),
+            "收到首帧麦克风音频"
+        );
+    }
     let level = frame_level(&frame);
     if capture.streaming_backend {
         if capture.stream_active {
@@ -217,6 +222,8 @@ struct CaptureRuntime {
     audio_input: Option<AudioInput>,
     audio_rx: Option<Receiver<Vec<i16>>>,
     last_frame_at: Instant,
+    received_frames: u64,
+    missing_input_logged: bool,
     streaming_backend: bool,
     stream_active: bool,
 }
@@ -228,10 +235,38 @@ impl CaptureRuntime {
             audio_input: None,
             audio_rx: None,
             last_frame_at: Instant::now(),
+            received_frames: 0,
+            missing_input_logged: false,
             streaming_backend,
             stream_active: false,
         }
     }
+}
+
+fn report_capture_silence(
+    capture: &mut CaptureRuntime,
+    state: &SharedRuntimeState,
+    overlay: &OverlayHandle,
+) {
+    if capture.received_frames == 0 {
+        if !capture.missing_input_logged {
+            capture.missing_input_logged = true;
+            warn!("录音已启动但没有收到麦克风数据");
+        }
+        overlay.set(overlay_state(
+            state,
+            OverlayMode::Error {
+                message: "没有收到麦克风数据".to_string(),
+            },
+        ));
+        return;
+    }
+    overlay.set(overlay_state(
+        state,
+        OverlayMode::Silence {
+            pending: pending_count(state),
+        },
+    ));
 }
 
 fn handle_hotkey_event(
@@ -355,6 +390,8 @@ fn begin_capture(
         false
     };
     capture.capturing = true;
+    capture.received_frames = 0;
+    capture.missing_input_logged = false;
     capture.last_frame_at = Instant::now();
     overlay.set(overlay_state(state, OverlayMode::Recording { level: 0.0 }));
     Ok(())

@@ -61,7 +61,7 @@ walkdir = "2"
 block2 = "0.6"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSButton", "NSCell", "NSControl", "NSEvent", "NSMenu", "NSMenuItem", "NSResponder", "NSRunningApplication", "NSScreen", "NSStatusBar", "NSStatusBarButton", "NSStatusItem", "NSView", "NSWindow", "objc2-core-foundation"] }
-objc2-avf-audio = { version = "0.3", features = ["AVAudioBuffer", "AVAudioEngine", "AVAudioFormat", "AVAudioIONode", "AVAudioNode", "AVAudioTime", "AVAudioTypes", "block2"] }
+objc2-avf-audio = { version = "0.3", features = ["AVAudioBuffer", "AVAudioEngine", "AVAudioFormat", "AVAudioIONode", "AVAudioMixerNode", "AVAudioNode", "AVAudioTime", "AVAudioTypes", "block2"] }
 objc2-core-graphics = { version = "0.3", features = ["CGDirectDisplay"] }
 objc2-foundation = { version = "0.3", features = ["NSObject", "NSString"] }
 raw-window-handle = "0.6"
