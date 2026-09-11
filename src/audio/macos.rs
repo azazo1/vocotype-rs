@@ -1,8 +1,9 @@
 use std::ptr::NonNull;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::AtomicU64,
 };
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -36,11 +37,13 @@ pub(super) struct VoiceProcessingInput {
     restarts: u64,
     failures: u64,
     next_attempt_at: Instant,
+    stopped: bool,
 }
 
 impl VoiceProcessingInput {
     pub(super) fn start() -> Result<(Self, Receiver<Vec<i16>>)> {
         let started_at = Instant::now();
+        wait_for_pending_release();
         let engine = unsafe { AVAudioEngine::init(AVAudioEngine::alloc()) };
         let input = unsafe { engine.inputNode() };
 
@@ -104,6 +107,7 @@ impl VoiceProcessingInput {
             restarts: 0,
             failures: 0,
             next_attempt_at: Instant::now(),
+            stopped: false,
         };
         unsafe {
             stream.input.installTapOnBus_bufferSize_format_block(
@@ -166,15 +170,64 @@ impl VoiceProcessingInput {
             }
         }
     }
-}
 
-impl Drop for VoiceProcessingInput {
-    fn drop(&mut self) {
+    /// 停止采集并释放 Voice Processing.
+    /// 释放这一步实测要 600 ms 左右(系统在拆 Voice Processing 的设备代理), 所以丢到后台线程做,
+    /// 避免卡住 daemon 主循环, 也免得下一次热键要等它.
+    pub(super) fn stop_in_background(mut self) {
+        self.shutdown();
+        match thread::Builder::new()
+            .name("vocotype-audio-release".to_string())
+            .spawn(move || drop(self))
+        {
+            Ok(handle) => store_pending_release(handle),
+            Err(error) => warn!(%error, "无法创建音频释放线程, 改在当前线程释放"),
+        }
+    }
+
+    fn shutdown(&mut self) {
+        if self.stopped {
+            return;
+        }
+        self.stopped = true;
         unsafe {
             self.input.removeTapOnBus(INPUT_BUS);
             self.engine.stop();
         }
         info!("macOS 语音处理音频采集已停止, 其他应用音量已恢复");
+    }
+}
+
+// 上一个引擎还在释放时又新建一个 Voice Processing 引擎, 容易互相干扰,
+// 所以开始新一轮采集前先等上一次释放结束(正常情况下它早就结束了, 不会阻塞).
+static PENDING_RELEASE: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
+
+fn store_pending_release(handle: JoinHandle<()>) {
+    let Ok(mut slot) = PENDING_RELEASE.lock() else {
+        return;
+    };
+    if let Some(previous) = slot.replace(handle) {
+        let _ = previous.join();
+    }
+}
+
+fn wait_for_pending_release() {
+    let handle = PENDING_RELEASE
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take());
+    if let Some(handle) = handle {
+        let _ = handle.join();
+    }
+}
+
+// 采集对象只在创建它的线程上使用, 只有销毁会交给另一个线程(见 stop_in_background):
+// Objective-C 对象的引用计数是原子的, 在别的线程上 dealloc 是安全的.
+unsafe impl Send for VoiceProcessingInput {}
+
+impl Drop for VoiceProcessingInput {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 

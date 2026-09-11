@@ -156,7 +156,7 @@ impl Drop for AudioInput {
             match stream {
                 AudioStream::Cpal(stream) => drop(stream),
                 #[cfg(target_os = "macos")]
-                AudioStream::VoiceProcessing(stream) => drop(stream),
+                AudioStream::VoiceProcessing(stream) => stream.stop_in_background(),
             }
             info!("音频采集已停止");
         }
