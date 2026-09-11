@@ -98,6 +98,9 @@ pub(super) fn run_daemon_loop(
                 }
             }
             default(Duration::from_millis(30)) => {
+                if capture.capturing {
+                    maintain_audio_input(&mut capture);
+                }
                 if capture.capturing && let Some(rx) = capture.audio_rx.clone() {
                     match rx.recv_timeout(Duration::from_millis(10)) {
                         Ok(frame) => {
@@ -139,6 +142,12 @@ pub(super) fn run_daemon_loop(
                 }
             }
         }
+    }
+}
+
+fn maintain_audio_input(capture: &mut CaptureRuntime) {
+    if let Some(input) = capture.audio_input.as_mut() {
+        input.maintain();
     }
 }
 
@@ -370,25 +379,37 @@ fn begin_capture(
     debug!("开始录音");
     begin_recording_session(state);
     overlay.set(overlay_state(state, OverlayMode::Starting));
-    let input = AudioInput::start(None, duck_other_audio).map_err(|error| {
-        overlay.set(overlay_state(
-            state,
-            OverlayMode::Error {
-                message: format!("音频采集启动失败: {}", error),
-            },
-        ));
-        error
-    })?;
-    capture.audio_rx = Some(input.receiver());
-    capture.audio_input = Some(input);
-    if let Some(segmenter) = segmenter {
-        segmenter.reset();
-    }
+    // 先把实时流式任务交给 worker, 让模型加载和麦克风准备并行进行, 缩短"麦克风准备"的等待.
     capture.stream_active = if capture.streaming_backend {
         submit_stream_start(task_tx, state, overlay, Vec::new())?
     } else {
         false
     };
+    // submit_stream_start 会把悬浮窗切到转写状态, 这里改回准备状态.
+    overlay.set(overlay_state(state, OverlayMode::Starting));
+    let input = match AudioInput::start(None, duck_other_audio) {
+        Ok(input) => input,
+        Err(error) => {
+            if capture.stream_active {
+                capture.stream_active = false;
+                if let Err(error) = submit_stream_finish(task_tx) {
+                    warn!(%error, "结束实时流式转写失败");
+                }
+            }
+            overlay.set(overlay_state(
+                state,
+                OverlayMode::Error {
+                    message: format!("音频采集启动失败: {}", error),
+                },
+            ));
+            return Err(error);
+        }
+    };
+    capture.audio_rx = Some(input.receiver());
+    capture.audio_input = Some(input);
+    if let Some(segmenter) = segmenter {
+        segmenter.reset();
+    }
     capture.capturing = true;
     capture.received_frames = 0;
     capture.missing_input_logged = false;

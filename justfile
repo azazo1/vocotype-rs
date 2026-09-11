@@ -25,7 +25,7 @@ dist:
 # just run-daemon --hotkey F2
 # 启动 daemon.
 run-daemon *args:
-    cargo run -- daemon {{args}}
+    cargo run --release -- daemon {{args}}
 
 # 生成 macOS .app bundle, 输出到 target/macos-app/VocoType.app.
 macos-app: build-icon

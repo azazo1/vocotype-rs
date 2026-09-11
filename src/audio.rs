@@ -138,6 +138,15 @@ impl AudioInput {
         self.receiver.clone()
     }
 
+    /// 采集期间的自检: 后端被系统打断时在这里恢复(目前只有 macOS Voice Processing 需要).
+    pub fn maintain(&mut self) {
+        match self.stream.as_mut() {
+            Some(AudioStream::Cpal(_)) | None => {}
+            #[cfg(target_os = "macos")]
+            Some(AudioStream::VoiceProcessing(stream)) => stream.maintain(),
+        }
+    }
+
     pub fn stop(self) {}
 }
 
